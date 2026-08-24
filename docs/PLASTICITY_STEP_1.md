@@ -116,7 +116,38 @@ YAML configs in `ard-isaaclab-tasks` directly
 `output_consumers = [network.mu, network.value]` — `sigma` excluded for
 both, not a per-task check.
 
-## 1b. Frame-based logging cadence, separate from optimizer-step cadence
+## 1b. Logging cadence — call `summary()` once per epoch, same as the reference
+
+**Revised** (superseded the original frame-boundary-gating design below, kept
+struck through for history). Traced how the reference actually calls
+`summary()`: `training_runner.py::run_training()` only invokes
+`self.agent.train()` once per `number_steps_per_train_policy` env steps
+(default 10000, gated at the top of the loop) — i.e. once per "epoch" in the
+reference's own terms, flushing the memory buffer each time. Inside
+`PPO.py::update_from_batch`, the `summary()` calls (lines 649-650) sit at the
+end of that same once-per-epoch call, after the mini-epoch/minibatch loop —
+not once per minibatch, not once per env step.
+
+rl_games' `write_stats()` is also only called once per epoch (`train()`'s
+main loop), never once per minibatch/optimizer step. So the two codebases'
+call frequency for `summary()` already matches directly — there's no
+mismatch to correct with an extra gating layer. `curr_frames` (the number of
+env frames one epoch produces) is fixed for the whole run
+(`horizon_length × num_actors × num_agents`), so "once per K epochs" and
+"once per K×curr_frames frames" are the same schedule, not just similar.
+
+Fix: don't add a separate frame-boundary-crossing counter inside the
+manager. Call `manager.summary(...)` once per epoch from `write_stats`
+(matching the reference's call site 1:1) and log whatever dict it returns
+straight through `self.writer.add_scalar(...)`, keyed by `frame` (the value
+`write_stats` already has on hand) purely as the **x-axis tag** — not as a
+gating condition. `log_interval`/`rank_interval`/`knife_interval` stay as
+the reference implements them: an internal counter incremented once per
+`summary()` call (i.e. once per epoch, same cadence either codebase), same
+as `cares_reinforcement_learning`'s `step_count`.
+
+<details>
+<summary>Superseded: original frame-boundary-gating design</summary>
 
 Lives in the run-time (continuous) part of the manager, inside `summary()`.
 Recomputing every diagnostic metric — especially rank, the expensive one —
@@ -133,6 +164,12 @@ and logs. Frame count is used (not a raw internal step counter, as the
 reference does) because it's Isaac Lab's natural progress unit, and one
 optimizer step corresponds to a variable, config-dependent number of
 environment frames.
+
+This assumed `summary()` might be called more often than once per epoch
+(e.g. per minibatch) — checked against the actual call sites in both
+codebases and that assumption doesn't hold; superseded above.
+
+</details>
 
 ## 1c. Rollout activation subsampling (`rollout_samples_per_forward`)
 
@@ -178,7 +215,7 @@ something either task will actually hit.
 |---|---|---|
 | 1a | Once, at construction (`_discover_sites`) | What counts as a site, and what its consumer(s) are |
 | 1d | Once, at construction (`_discover_sites`) | What gets excluded from being a site at all |
-| 1b | Continuously, every epoch (`summary`) | How often expensive diagnostics actually get computed |
+| 1b | Every `summary()` call (once per epoch, same cadence as the reference's `step_count`) | How often expensive diagnostics (rank, KNIFE) actually get computed |
 | 1c | Continuously, every rollout step (forward hook) | How much rollout data gets recorded per step |
 
 1a and 1d together fully determine `self.sites` — the fixed list every other
@@ -193,7 +230,8 @@ only *how much*/*how often* data gets recorded and reported.
 2. `NetworkPlasticityManager` (`plasticity.py`) with `output_consumers`
    support from the start (1a) — don't bolt it on after the fact.
 3. Add 1d's scope guards to the same discovery pass.
-4. Add 1b's frame/optimizer-step counters to `summary()`.
+4. Add 1b's `step_count`-based interval gating to `summary()` (mirrors the
+   reference directly — call site frequency already matches, see 1b above).
 5. Add 1c's subsampling to the forward hook.
 6. **Before moving to Step 2**: run a standalone site-discovery test against
    the real `cartpole`/`shadow_hand` network shapes — print discovered

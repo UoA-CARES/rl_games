@@ -1,0 +1,95 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="a2c_common vs a2c_continuous" id="a2c-arch">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ===================== LEFT: class hierarchy ===================== -->
+        <mxCell id="title-left" value="Class hierarchy" style="text;html=1;fontSize=16;fontStyle=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="360" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="base" value="A2CBase&#10;a2c_common.py : 63&#10;&#10;get_action_values(), get_values(),&#10;write_stats(), trancate_gradients_and_step()&#10;- shared by every A2C-family algorithm" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;align=center;verticalAlign=middle;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="60" width="360" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cont" value="ContinuousA2CBase&#10;a2c_common.py : 1072&#10;&#10;train(), train_epoch(), play_steps(),&#10;prepare_dataset()&#10;- owns the main loop shape" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="360" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="agent" value="A2CAgent&#10;a2c_continuous.py : 14&#10;&#10;__init__(), calc_gradients()&#10;- the one method with no clean&#10;override seam (forward+loss+backward&#10;all inline, no hook point)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=center;verticalAlign=middle;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="340" width="360" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;startArrow=none;" edge="1" parent="1" source="cont" target="base">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e1lbl" value="extends" style="text;html=1;fontSize=10;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="230" y="178" width="60" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;startArrow=none;" edge="1" parent="1" source="agent" target="cont">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2lbl" value="extends" style="text;html=1;fontSize=10;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="230" y="318" width="60" height="20" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== RIGHT: call flow ===================== -->
+        <mxCell id="title-right" value="Call flow, one epoch" style="text;html=1;fontSize=16;fontStyle=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="520" y="20" width="360" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="f1" value="train()  —  loops forever" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="520" y="60" width="360" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="f2" value="train_epoch()  —  once per epoch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="520" y="130" width="360" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="f3" value="play_steps()  —  ROLLOUT phase" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="200" width="320" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="f4" value="get_action_values()  x horizon_length steps" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="560" y="270" width="280" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="f5" value="calc_gradients()  —  UPDATE phase&#10;x (mini_epochs_num  x  num_minibatches)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="335" width="320" height="55" as="geometry" />
+        </mxCell>
+
+        <mxCell id="f6" value="trancate_gradients_and_step()&#10;grad clip + optimizer.step()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="560" y="415" width="280" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="f7" value="write_stats()  —  once per epoch, logs to TensorBoard" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="540" y="485" width="320" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="fe1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="f1" target="f2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="fe2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="f2" target="f3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="fe3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="f3" target="f4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="fe4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="f4" target="f5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="fe5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="f5" target="f6"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="fe6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="f6" target="f7"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- divider -->
+        <mxCell id="divider" style="endArrow=none;html=1;strokeColor=#999999;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="460" y="20" as="sourcePoint" />
+            <mxPoint x="460" y="560" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===================== BOTTOM: explanation note ===================== -->
+        <mxCell id="note" value="Why the file split matters for plasticity work&#10;&#10;a2c_common.py (~1350 lines, shared): used by every A2C-family algorithm (discrete, continuous, RNN variants).&#10;Owns the loop shape, rollout, replacement timing, and logging - but has no idea what &quot;loss&quot; means for any&#10;specific algorithm.&#10;&#10;a2c_continuous.py (~180 lines, specific): only calc_gradients() and __init__ live here - the one method&#10;that actually computes PPO's continuous-action loss (forward + backward inline, no seam to hook into).&#10;&#10;Step 2 of the plasticity integration plan edits exactly 5 methods across these two files -&#10;get_action_values, calc_gradients, trancate_gradients_and_step, write_stats, and __init__.&#10;Nothing else in either file needs to change." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;spacing=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="600" width="840" height="230" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

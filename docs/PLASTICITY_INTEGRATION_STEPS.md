@@ -138,17 +138,41 @@ both tasks, `sigma` must **not** be included in `output_consumers` — there's
 no weight column tied to trunk units to reset for it.
 `output_consumers = [network.mu, network.value]` for both.
 
-### 1b. Frame-based logging cadence, separate from optimizer-step cadence
+### 1b. Logging cadence — matches the reference directly, no extra gating needed
 
-The reference's `PlasticityConfig` gates diagnostics off an internal
-`step_count` incremented once per `summary()` call. For Isaac Lab, track two
-independent counters instead:
-- `optimizer_steps` — drives `step_replacement()`'s cadence (still once per
-  minibatch/optimizer update, same as the reference).
-- `environment_frames` — drives `summary()`'s logging cadence
-  (`log_interval_frames`, `rank_interval_frames`), since frame count is
-  Isaac Lab's natural progress unit and one optimizer step corresponds to a
-  variable, config-dependent number of environment frames.
+**Revised** after tracing both codebases' actual call sites. The original
+plan here assumed `summary()` might be called more often than once per
+epoch (e.g. per minibatch), which would've made the reference's raw
+`step_count` an unreliable proxy for real training progress across
+differently-parallelized tasks. Checked against the real call sites and
+that assumption doesn't hold in either codebase:
+
+- Reference: `training_runner.py::run_training()` calls `self.agent.train()`
+  once per `number_steps_per_train_policy` env steps (default 10000,
+  gated at the top of the loop, flushing the memory buffer each time).
+  `PPO.py::update_from_batch`'s `summary()` calls (lines 649-650) sit at the
+  end of that same once-per-epoch call.
+- rl_games: `write_stats()` — where `summary()` gets wired in (Step 2e) — is
+  also only called once per epoch, from `train()`'s main loop, never once
+  per minibatch/optimizer step.
+
+Since both codebases already call `summary()` at the same frequency (once
+per epoch), and one epoch's frame count (`horizon_length × num_actors ×
+num_agents`) is fixed for the whole run, "once per K epochs" and "once per
+K×frames-per-epoch frames" are the same schedule, not just similar — there's
+no mismatch here to correct with a separate frame-boundary-crossing counter.
+
+Keep the reference's `step_count`-based interval gating (`log_interval`,
+`rank_interval`, `knife_interval`) as-is — copy how `summary()` is used 1:1.
+`frame` is still passed through to `self.writer.add_scalar(...)` in
+`write_stats` (Step 2e) as the **x-axis tag**, matching how rl_games already
+logs other metrics (`rewards/step` vs `rewards/iter`) — that's a logging
+concern, unrelated to how often `summary()` itself decides to compute
+anything.
+
+`optimizer_steps`/`on_optimizer_step()` (Step 2d) is a separate, unrelated
+counter — it drives CBP replacement cadence, not logging cadence, and stays
+as originally planned (once per minibatch/optimizer update).
 
 ### 1c. Rollout activation subsampling (`rollout_samples_per_forward`)
 
@@ -292,8 +316,12 @@ and critic heads.
 
 ### 2e. `write_stats` (`a2c_common.py:360-380`) — logging
 
-Append plasticity metrics to the existing scalar-writing loop, keyed by
-frame (not the internal step counter — see Step 1b):
+Append plasticity metrics to the existing scalar-writing loop. `summary()`
+itself doesn't take a `frame` argument (see revised Step 1b — its internal
+`step_count`-based interval gating already matches `write_stats`'s
+once-per-epoch call frequency, same as the reference); `frame` is only used
+here, same as every other scalar in this method, as the **x-axis tag** for
+TensorBoard:
 ```python
 def write_stats(self, total_time, epoch_num, step_time, play_time, update_time,
                  a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
@@ -301,7 +329,7 @@ def write_stats(self, total_time, epoch_num, step_time, play_time, update_time,
     ...  # existing scalars, unchanged
     if self.plasticity_enabled:
         for mgr in self.plasticity_managers:
-            for key, value in mgr.summary(frame=frame).items():
+            for key, value in mgr.summary().items():
                 self.writer.add_scalar(f"plasticity/{mgr.name}/{key}", value, frame)
 ```
 
@@ -348,8 +376,10 @@ on regardless of what the YAML says.
 
 ## Step 4 — Add a `plasticity:` config block per task
 
-Per-task block under `params.config`, now with the frame-based and
-subsampling fields from Step 1:
+Per-task block under `params.config`, now with the subsampling field from
+Step 1c. Logging cadence (`log_interval`/`rank_interval`/`knife_interval`)
+is a count of `summary()` calls — once per epoch, same units the reference
+uses — not a frame count (see revised Step 1b):
 
 ```yaml
 plasticity:
@@ -367,9 +397,9 @@ plasticity:
   activation_window_size: 10000
   rollout_samples_per_forward: 256
   compute_rank: true
-  log_interval_frames: 100000
-  rank_interval_frames: 1000000
-  knife_interval_summaries: 1
+  log_interval: 10      # summary() calls (= epochs) between regular diagnostics
+  rank_interval: 50     # summary() calls (= epochs) between rank computation
+  knife_interval: 1     # multiple of log_interval between KNIFE computation
   init: kaiming
   activation_name: elu   # both tasks use ELU — config default is relu, must override
 ```

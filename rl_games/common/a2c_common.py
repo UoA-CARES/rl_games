@@ -360,6 +360,15 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('info/epochs', epoch_num, frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
+        # Plasticity diagnostics (Step 2e). getattr default keeps this a
+        # no-op for every agent that doesn't attach any managers (Step 2f
+        # not wired up yet) - write_stats shouldn't require plasticity to
+        # be configured at all. mgr.summary()'s own keys already include
+        # mgr.name as a prefix, so we don't repeat it here.
+        for mgr in getattr(self, 'plasticity_managers', None) or []:
+            for key, value in mgr.summary().items():
+                self.writer.add_scalar(f'plasticity/{key}', value, frame)
+
     def set_eval(self):
         self.model.eval()
         if self.normalize_rms_advantage:
