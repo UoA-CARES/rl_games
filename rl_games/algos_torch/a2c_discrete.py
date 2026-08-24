@@ -33,6 +33,7 @@ class DiscreteA2CAgent(a2c_common.DiscreteA2CBase):
 
         self.last_lr = float(self.last_lr)
         self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.init_plasticity()
 
         if self.has_central_value:
             cv_config = {

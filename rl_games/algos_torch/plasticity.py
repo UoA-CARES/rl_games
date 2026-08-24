@@ -28,10 +28,11 @@
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import torch
 from torch import nn
@@ -48,6 +49,36 @@ SUPPORTED_ACTIVATIONS = (
     nn.Tanh,
     nn.Sigmoid,
 )
+
+
+def linear_consumers(module: nn.Module | None) -> list[nn.Linear]:
+    """Unwrap an rl_games head into the nn.Linear layer(s) that read the trunk.
+
+    Feeds `output_consumers` (1a): a trunk's final Linear has no consumer
+    inside its own Sequential - mu/logits/value are siblings of actor_mlp.
+    A real nn.Linear is required because sites match on `.in_features` and
+    _consumer_utility_weight reads `.weight`. Load-bearing today for
+    multi-discrete `logits`, which is an nn.ModuleList. The `.value_linear`
+    branch is defensive: DefaultValue/TwoHotEncodedValue (common/layers/
+    value.py) wrap theirs, but _build_value_layer is never called with a
+    value_type, so `value` is currently always a plain Linear.
+
+    Passed raw, an unwrappable head is dropped by __init__'s isinstance
+    filter: the final site then computes its utility weights from whatever
+    consumers survived, or is skipped entirely if none did (e.g. a
+    `separate` critic trunk, whose only consumer is the value head).
+    """
+    if module is None:
+        return []
+    if isinstance(module, nn.Linear):
+        return [module]
+    if isinstance(module, nn.ModuleList):
+        consumers = []
+        for head in module:
+            consumers += linear_consumers(head)
+        return consumers
+    inner = getattr(module, 'value_linear', None)
+    return [inner] if isinstance(inner, nn.Linear) else []
 
 
 class CaptureMode(Enum):
@@ -143,20 +174,36 @@ class NetworkPlasticityManager:
         optimizer: Optimizer,  # Optimizer used to read parameter updates for utility metrics.
         output_consumers: list[nn.Linear] | None = None,  # External linear heads consuming trunk features.
         name: str = "network",  # Label used to identify this network in summaries and diagnostics.
+
         enabled: bool = True,  # Enables or disables discovery, hooks, and metric collection.
-        training_only: bool = True,  # Restricts collection to training mode when enabled.
-        utility_decay: float = 0.99,  # Exponential decay applied to the running utility estimate.
-        activity_threshold: float = 1e-5,  # Minimum activation magnitude counted as neuron activity.
-        dormant_threshold: float = 0.1,  # Activity ratio below which a neuron is classified as dormant.
-        stagnant_threshold: float = 0.25,  # Update/utilization threshold for classifying a neuron as stagnant.
-        volatile_threshold: float = 4.0,  # Upper update/utilization threshold for classifying a neuron as volatile.
-        rua_eps: float = 1e-8,  # Numerical floor used by relative-update calculations.
+        replacement_enabled:bool = False, # TODO: Neuron replacement for injecting plasticity on or off.
+        replacement_strategy: Literal["cbp"] = "cbp", # TODO: specify replacement strategy
+
+        replacement_rate: float = 1e-5,
+        maturity_threshold: int = 1,
         activation_window_size: int = 10000,  # Number of recent activations retained for distribution statistics.
-        rollout_samples_per_forward: int | None = None,  # Cap rows taken from a single rollout forward pass (e.g. [num_envs, hidden]) before adding to the window. None = no subsampling.
-        compute_rank: bool = True,  # Whether to compute rank-based feature diagnostics.
+
         log_interval: int = 10,  # summary() calls (= epochs) between logged summaries. Alarm 1
         rank_interval: int = 50,  # summary() calls (= epochs) between rank calculations. Alarm 2
         knife_interval: int = 1,  # Multiple of log_interval between knife diagnostics. Alarm 3
+
+        utility_decay: float = 0.99,  # Exponential decay applied to the running utility estimate.
+
+        stagnant_threshold: float = 0.25,  # Update/utilization threshold for classifying a neuron as stagnant.
+        volatile_threshold: float = 4.0,  # Upper update/utilization threshold for classifying a neuron as volatile.
+        rua_eps: float = 1e-8,  # Numerical floor used by relative-update calculations.
+
+        activity_threshold: float = 1e-5,  # Minimum activation magnitude counted as neuron activity.
+        dormant_threshold: float = 0.1,  # Activity ratio below which a neuron is classified as dormant.
+
+        replacement_accumulate:bool = False,
+        compute_rank: bool = True,  # Whether to compute rank-based feature diagnostics.
+        training_only: bool = True,  # Restricts collection to training mode when enabled.
+
+        rollout_samples_per_forward: int | None = None,  # Cap rows taken from a single rollout forward pass (e.g. [num_envs, hidden]) before adding to the window. None = no subsampling.
+
+        init: str = "kaiming",
+        activation_name: str = "relu"
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -170,6 +217,23 @@ class NetworkPlasticityManager:
             for consumer in (output_consumers or ())
             if isinstance(consumer, nn.Linear)
         )
+        # A dropped head degrades the trunk's *final* feature site - the one the
+        # diagnostics care about most - too quiet a failure to leave silent.
+        dropped = [
+            type(consumer).__name__
+            for consumer in (output_consumers or ())
+            if not isinstance(consumer, nn.Linear)
+        ]
+        if dropped:
+            warnings.warn(
+                'NetworkPlasticityManager("{}") ignored {} non-Linear output_consumer(s) '
+                '({}); the trunk\'s final hidden layer loses them from its utility '
+                'weights, and is skipped entirely if no consumer remains. Pass heads '
+                'through plasticity.linear_consumers() first.'.format(
+                    name, len(dropped), ', '.join(sorted(set(dropped)))
+                ),
+                stacklevel=2,
+            )
         self.name = name
 
         self.enabled = enabled
