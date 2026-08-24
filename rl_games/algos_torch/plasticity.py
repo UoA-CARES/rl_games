@@ -152,6 +152,7 @@ class NetworkPlasticityManager:
         volatile_threshold: float = 4.0,  # Upper update/utilization threshold for classifying a neuron as volatile.
         rua_eps: float = 1e-8,  # Numerical floor used by relative-update calculations.
         activation_window_size: int = 10000,  # Number of recent activations retained for distribution statistics.
+        rollout_samples_per_forward: int | None = None,  # Cap rows taken from a single rollout forward pass (e.g. [num_envs, hidden]) before adding to the window. None = no subsampling.
         compute_rank: bool = True,  # Whether to compute rank-based feature diagnostics.
         log_interval: int = 10,  # summary() calls (= epochs) between logged summaries. Alarm 1
         rank_interval: int = 50,  # summary() calls (= epochs) between rank calculations. Alarm 2
@@ -180,6 +181,7 @@ class NetworkPlasticityManager:
         self.volatile_threshold = volatile_threshold
         self.rua_eps = rua_eps
         self.activation_window_size = activation_window_size
+        self.rollout_samples_per_forward = rollout_samples_per_forward
         self.compute_rank = compute_rank
         self.log_interval = log_interval
         self.rank_interval = rank_interval
@@ -434,6 +436,11 @@ class NetworkPlasticityManager:
         max_rows = int(self.activation_window_size)
         if max_rows <= 0:
             return
+
+        limit = self.rollout_samples_per_forward
+        if limit is not None and activation.shape[0] > limit:
+            idx = torch.randperm(activation.shape[0], device=activation.device)[:limit]
+            activation = activation[idx]
 
         chunk = activation.detach().float().cpu()
         state.activity.behaviour_chunks.append(chunk)
