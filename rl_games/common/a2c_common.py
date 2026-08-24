@@ -476,6 +476,52 @@ class A2CBase(BaseAlgorithm):
                 len(manager.sites), name, ', '.join(site.name for site in manager.sites)))
             self.plasticity_managers.append(manager)
 
+    def _restore_plasticity_state(self, saved):
+        """Restore per-trunk plasticity diagnostics from a checkpoint.
+
+        Called from set_full_state_weights. State is always restored when it is
+        there - there is no config key for this. Every mismatch path reports and
+        starts that manager fresh, and nothing here may raise: losing
+        diagnostics continuity is a nuisance, but taking down an otherwise
+        perfectly resumable run over it would not be.
+
+        The managers themselves need no re-pointing after a restore - see
+        NetworkPlasticityManager.load_state_dict for why the model/optimizer
+        references and the registered hooks all survive it.
+
+        Touches nothing but self.plasticity_managers, so it stays testable
+        against a stub without standing up a whole agent.
+        """
+        if not self.plasticity_managers:
+            if saved:
+                print('Plasticity: checkpoint carries plasticity state but plasticity is not '
+                      'active in this run - ignoring it.')
+            return
+
+        if not saved:
+            print('Plasticity: checkpoint has no plasticity state (saved before it was '
+                  'added?) - diagnostics restart from zero.')
+            return
+
+        for manager in self.plasticity_managers:
+            entry = saved.get(manager.name)
+            if entry is None:
+                print('Plasticity: no saved state for "{}" trunk (checkpoint has: {}) - '
+                      'starting fresh.'.format(manager.name, ', '.join(sorted(saved)) or 'none'))
+                continue
+
+            if manager.load_state_dict(entry):
+                # site_states is empty until a hook has actually fired, so
+                # "0 site state(s)" is the expected line today - the capture
+                # contexts are not wired into the training loop yet.
+                print('Plasticity: restored "{}" trunk (step_count={}, {} site state(s)).'.format(
+                    manager.name, manager.step_count, len(manager.site_states)))
+
+        unused = sorted(set(saved) - {manager.name for manager in self.plasticity_managers})
+        if unused:
+            print('Plasticity: checkpoint had unused plasticity state for: {}.'.format(
+                ', '.join(unused)))
+
     def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
         # do we need scaled time?
         self.diagnostics.send_info(self.writer)
@@ -745,6 +791,18 @@ class A2CBase(BaseAlgorithm):
             env_state = self.vec_env.get_env_state()
             state['env_state'] = env_state
 
+        # Plasticity diagnostics, one entry per managed trunk keyed by manager
+        # name ('actor'/'critic' or 'shared' - init_plasticity guarantees these
+        # are unique). Omitted entirely when plasticity is off, so checkpoints
+        # from non-plasticity runs keep exactly the shape they have today.
+        # Deliberately not in get_weights(): that pair is also the self-play
+        # weight-sync path (self_play_manager) and the shape players read, and
+        # training-only diagnostics have no business on either.
+        if self.plasticity_managers:
+            state['plasticity'] = {
+                manager.name: manager.state_dict() for manager in self.plasticity_managers
+            }
+
         return state
 
     def set_full_state_weights(self, weights):
@@ -761,6 +819,13 @@ class A2CBase(BaseAlgorithm):
 
         if self.vec_env is not None:
             self.vec_env.set_env_state(env_state)
+
+        # Last on purpose. Nothing above depends on it, and two things argue for
+        # the end: the managers resolve their tensors' device from the trunk's
+        # weights, which should be read after the model has been restored; and a
+        # diagnostics-only feature must never be in a position to abort a resume
+        # of the weights that actually matter.
+        self._restore_plasticity_state(weights.get('plasticity', None))
 
     def get_weights(self):
         state = self.get_stats_weights()

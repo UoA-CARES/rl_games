@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum, auto
 from typing import Any, Iterator, Literal
 
@@ -143,6 +143,121 @@ class SiteSummary:
     num_units: float
     metrics: dict[str, float]
     distributions: dict[str, torch.Tensor]
+
+
+# =============================================================================
+# Checkpoint serialization helpers (see state_dict / load_state_dict below)
+# =============================================================================
+
+# Bumped whenever the saved layout changes shape. load_state_dict refuses a
+# version it does not recognise rather than guessing at a partial match.
+PLASTICITY_STATE_VERSION = 1
+
+# Fields deliberately left out of the checkpoint, mapped to the factory that
+# rebuilds them empty on load. behaviour_chunks is the raw activation ring
+# buffer: a short-lived window that _reset_summary_windows already clears at
+# every log, and at the default activation_window_size it runs to tens of MB
+# per site. A resumed manager simply refills it.
+_STATE_SKIP_FIELDS = {'behaviour_chunks': list, 'behaviour_rows': int}
+
+# Nested dataclass fields, keyed by (owner, field). Anything not listed here
+# and not skipped is treated as a plain per-unit tensor.
+#
+# A table rather than dataclasses.fields(...).type because this module uses
+# `from __future__ import annotations`, which makes f.type the *string*
+# 'RunningAverageState' rather than the class. It is also the safer failure
+# mode: a field added without an entry here gets treated as a tensor, and
+# _load_state_tree's shape check rejects it loudly instead of silently
+# dropping a statistic.
+_STATE_NESTED_TYPES = {
+    (SiteState, 'utility'): UtilityState,
+    (SiteState, 'activity'): ActivityState,
+    (SiteState, 'redo'): RedoState,
+    (SiteState, 'knife'): KnifeState,
+    (ActivityState, 'window'): RunningAverageState,
+    (ActivityState, 'lifetime'): RunningAverageState,
+    (KnifeState, 'window'): RunningAverageState,
+    (KnifeState, 'lifetime'): RunningAverageState,
+}
+
+
+class _PlasticityStateMismatch(Exception):
+    """Saved state does not fit the live sites. Caught and turned into a warning."""
+
+
+def _dump_state_tree(obj: Any) -> Any:
+    """Convert a state dataclass into plain dicts of CPU tensors.
+
+    Dispatches structurally (is_dataclass / is_tensor) so field names are
+    written exactly once, in the dataclass definitions themselves.
+    """
+    if is_dataclass(obj):
+        return {
+            field.name: _dump_state_tree(getattr(obj, field.name))
+            for field in fields(obj)
+            if field.name not in _STATE_SKIP_FIELDS
+        }
+
+    if torch.is_tensor(obj):
+        # copy=True is required, not decorative: for a CPU model .cpu() returns
+        # the *same* tensor object, so the "snapshot" would alias live state
+        # that the hooks keep mutating in place (add_/mul_ below).
+        return obj.detach().to('cpu', copy=True)
+
+    return obj
+
+
+def _load_state_tree(
+    cls: type,
+    data: Any,
+    device: torch.device,
+    num_units: int,
+    path: str,
+) -> Any:
+    """Rebuild a state dataclass from _dump_state_tree output, onto `device`."""
+    if not isinstance(data, dict):
+        raise _PlasticityStateMismatch(
+            '{}: expected a dict, got {}'.format(path, type(data).__name__)
+        )
+
+    kwargs: dict[str, Any] = {}
+    for field in fields(cls):
+        field_path = '{}.{}'.format(path, field.name)
+
+        skip_factory = _STATE_SKIP_FIELDS.get(field.name)
+        if skip_factory is not None:
+            kwargs[field.name] = skip_factory()
+            continue
+
+        if field.name not in data:
+            raise _PlasticityStateMismatch('{}: missing from saved state'.format(field_path))
+        value = data[field.name]
+
+        nested_cls = _STATE_NESTED_TYPES.get((cls, field.name))
+        if nested_cls is not None:
+            kwargs[field.name] = _load_state_tree(
+                nested_cls, value, device, num_units, field_path
+            )
+            continue
+
+        if not torch.is_tensor(value):
+            raise _PlasticityStateMismatch(
+                '{}: expected a tensor, got {}'.format(field_path, type(value).__name__)
+            )
+        if tuple(value.shape) != (num_units,):
+            raise _PlasticityStateMismatch(
+                '{}: expected shape ({},), got {}'.format(
+                    field_path, num_units, tuple(value.shape)
+                )
+            )
+
+        # dtype is forced rather than inherited: _ensure_site_state allocates
+        # via default-dtype torch.zeros, while an activation captured under
+        # torch.cuda.amp.autocast can be half. Restored tensors have to stay
+        # interchangeable with freshly allocated ones.
+        kwargs[field.name] = value.to(device=device, dtype=torch.float32)
+
+    return cls(**kwargs)
 
 
 class NetworkPlasticityManager:
@@ -281,7 +396,214 @@ class NetworkPlasticityManager:
         for handle in self.grad_handles:
             handle.remove()
         self.grad_handles.clear()
-        
+
+    # =========================================================================
+    # Checkpointing (state_dict / load_state_dict)
+    # =========================================================================
+
+    @torch.no_grad()
+    def state_dict(self) -> dict[str, Any]:
+        """Snapshot the accumulated plasticity statistics for a checkpoint.
+
+        Everything here is state the hooks build up over a run: neuron ages,
+        utility/ReDo EMAs, lifetime activity, KNIFE update-ratios, and the
+        step_count driving the logging cadence. Without it a resumed run
+        restarts every EMA and every age at zero while the model and optimizer
+        carry on, so the diagnostics end up describing a network that does not
+        exist.
+
+        Not saved: `sites` and the hook handles (live object references),
+        `_capture_modes` (transient), `last_summary` (regenerated by the next
+        summary()), and the activation window (see _STATE_SKIP_FIELDS).
+
+        Tensors come back on the CPU. torch_ext.load_checkpoint calls
+        torch.load() with no map_location, so a CUDA-resident tensor would
+        deserialize onto the saving device's *ordinal* and fail on a CPU-only
+        box or a machine with fewer GPUs. Saving CPU keeps device selection
+        entirely in load_state_dict's hands. It also holds the payload to
+        dict/list/str/int/float/Tensor, all allow-listed under
+        torch.load(weights_only=True) - the default from torch 2.6 on.
+        """
+        return {
+            'version': PLASTICITY_STATE_VERSION,
+            'name': self.name,
+            'step_count': int(self.step_count),
+            # Topology, read off the discovered sites - available as soon as
+            # _discover_sites() has run, independently of whether any hook ever
+            # fired. This is what load_state_dict validates against.
+            'site_order': [site.name for site in self.sites],
+            'num_units': {
+                site.name: int(site.producer_module.out_features)
+                for site in self.sites
+            },
+            # Only the scalars that change what the stored numbers *mean*.
+            # Summarize-time settings (stagnant/volatile/dormant thresholds,
+            # rank_interval, compute_rank) are excluded because they never touch
+            # accumulation, and so is activation_window_size, which only sizes
+            # the window we deliberately drop.
+            'config': {
+                'utility_decay': self.utility_decay,
+                'activity_threshold': self.activity_threshold,
+                'rua_eps': self.rua_eps,
+                'log_interval': self.log_interval,
+                'knife_interval': self.knife_interval,
+            },
+            'site_states': {
+                name: _dump_state_tree(state)
+                for name, state in self.site_states.items()
+            },
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state: Any, strict: bool = False) -> bool:
+        """Restore statistics saved by state_dict(). Returns True iff applied.
+
+        Restores *statistics*, never object references. `self.model` and
+        `self.optimizer` deliberately do not need re-pointing after a checkpoint
+        restore: rl_games restores in place - model.load_state_dict() with the
+        default assign=False copies into the existing Parameters, and
+        optimizer.load_state_dict() mutates the same Optimizer - so every module
+        and every Parameter keeps its identity, and with it the forward hooks
+        bound to site.hook_module and the grad hooks bound to the
+        site.producer_module.weight *tensor*. That argument holds only while
+        restore stays in-place: a load_state_dict(..., assign=True) anywhere, or
+        rebuilding the network after init_plasticity() has run, would replace
+        the Parameters and silently orphan every grad hook.
+
+        Two kinds of "missing" turn up here, and they are treated oppositely:
+
+          site_order / num_units vs. self.sites  -- TOPOLOGY.
+              Recorded at save time from the discovered sites, which exist as
+              soon as _discover_sites() has run - i.e. always, and independently
+              of whether any hook ever fired. A difference therefore means the
+              network itself changed (mlp.units, `separate`, an activation type
+              that made a site disappear), and every saved per-unit vector is
+              meaningless.
+              -> warn, restore nothing, leave self.site_states untouched.
+
+          site_states missing an entry for a site that IS in site_order -- STATS.
+              Expected, and silent. site_states is populated lazily by the hooks
+              (_ensure_site_state), so a site has no entry until it has actually
+              been captured. Today capture_training()/capture_metrics() are not
+              wired into the training loop at all, so *every real checkpoint*
+              carries a full site_order and an empty site_states - warning here
+              would fire on every normal resume.
+              -> skip it; _ensure_site_state allocates on the first hook fire.
+
+        strict=False (the agent path) warns and returns False on a mismatch;
+        strict=True raises instead, for tests and explicit callers.
+        """
+        def describe(message: str) -> str:
+            return 'NetworkPlasticityManager("{}"): {}'.format(self.name, message)
+
+        def reject(message: str) -> bool:
+            if strict:
+                raise ValueError(describe(message))
+            warnings.warn(describe(message), stacklevel=3)
+            return False
+
+        def note(message: str) -> None:
+            warnings.warn(describe(message), stacklevel=3)
+
+        # Nothing accumulates in a manager with no sites, so there is nothing to
+        # restore into. Silent - this is not a mismatch.
+        if not self.enabled or not self.sites:
+            return False
+
+        if not isinstance(state, dict):
+            return reject('saved state is {}, expected a dict; starting fresh'.format(
+                type(state).__name__))
+
+        version = state.get('version')
+        if version != PLASTICITY_STATE_VERSION:
+            return reject('saved state is version {!r}, expected {}; starting fresh'.format(
+                version, PLASTICITY_STATE_VERSION))
+
+        # A name mismatch means the caller paired the wrong entry with this
+        # manager. Worth saying out loud, but the state itself may still be
+        # fine, and the topology check below is the one that can actually prove
+        # it is not.
+        saved_name = state.get('name')
+        if saved_name != self.name:
+            note('saved state came from trunk "{}"; loading it here anyway'.format(saved_name))
+
+        live_units = {
+            site.name: int(site.producer_module.out_features) for site in self.sites
+        }
+        saved_order = list(state.get('site_order') or [])
+        saved_units = dict(state.get('num_units') or {})
+        saved_sites = dict(state.get('site_states') or {})
+
+        # Saved by a manager that had discovered nothing (a disabled one, say):
+        # no topology to check and nothing to restore beyond the cadence.
+        if not saved_order and not saved_sites:
+            self.step_count = int(state.get('step_count', 0))
+            self.last_summary = {}
+            return True
+
+        missing = sorted(set(live_units) - set(saved_order))
+        extra = sorted(set(saved_order) - set(live_units))
+        if missing or extra:
+            return reject(
+                'site topology changed since the checkpoint (not in the saved state: {}; '
+                'saved but no longer present: {}); starting fresh'.format(
+                    ', '.join(missing) or 'none', ', '.join(extra) or 'none'))
+
+        rewidened = [
+            '{} ({} -> {})'.format(name, saved_units.get(name), live_units[name])
+            for name in sorted(live_units)
+            if saved_units.get(name) != live_units[name]
+        ]
+        if rewidened:
+            return reject('site width(s) changed since the checkpoint: {}; starting fresh'.format(
+                ', '.join(rewidened)))
+
+        changed = [
+            '{}: {!r} -> {!r}'.format(key, value, getattr(self, key))
+            for key, value in sorted((state.get('config') or {}).items())
+            if hasattr(self, key) and getattr(self, key) != value
+        ]
+        if changed:
+            note('accumulation settings changed since the checkpoint ({}); restoring '
+                 'anyway, the EMAs re-converge under the new settings'.format('; '.join(changed)))
+
+        # Rebuild into a local dict first: every failure path below must leave
+        # self.site_states exactly as it found it, so a rejected load never
+        # half-applies.
+        rebuilt: dict[str, SiteState] = {}
+        for site in self.sites:
+            entry = saved_sites.get(site.name)
+            if entry is None:
+                # Silent by design: no saved stats for this site just means no
+                # hook ever fired for it. Topology is validated above; this is
+                # the STATS level. See the docstring.
+                continue
+
+            # Device is resolved from the producer weight, per site. It cannot
+            # come from anywhere else: site_states is populated lazily and is
+            # normally empty at restore time (restore() runs straight after
+            # init_plasticity(), before any forward pass), and the checkpoint
+            # deliberately holds CPU tensors. producer_module is an nn.Linear
+            # already moved by model.to(ppo_device), so its weight sits on
+            # exactly the device the hook's output will be on - the same one
+            # _ensure_site_state would have picked. Per-site rather than
+            # per-manager, so a model-parallel trunk stays correct.
+            try:
+                rebuilt[site.name] = _load_state_tree(
+                    SiteState,
+                    entry,
+                    device=site.producer_module.weight.device,
+                    num_units=live_units[site.name],
+                    path=site.name,
+                )
+            except _PlasticityStateMismatch as exc:
+                return reject('could not restore site state ({}); starting fresh'.format(exc))
+
+        self.site_states = rebuilt
+        self.step_count = int(state.get('step_count', 0))
+        self.last_summary = {}
+        return True
+
 # =========================================================================
 
     @property
