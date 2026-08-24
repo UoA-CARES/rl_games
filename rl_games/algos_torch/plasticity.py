@@ -31,7 +31,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import torch
 from torch import nn
@@ -143,20 +143,36 @@ class NetworkPlasticityManager:
         optimizer: Optimizer,  # Optimizer used to read parameter updates for utility metrics.
         output_consumers: list[nn.Linear] | None = None,  # External linear heads consuming trunk features.
         name: str = "network",  # Label used to identify this network in summaries and diagnostics.
+
         enabled: bool = True,  # Enables or disables discovery, hooks, and metric collection.
-        training_only: bool = True,  # Restricts collection to training mode when enabled.
-        utility_decay: float = 0.99,  # Exponential decay applied to the running utility estimate.
-        activity_threshold: float = 1e-5,  # Minimum activation magnitude counted as neuron activity.
-        dormant_threshold: float = 0.1,  # Activity ratio below which a neuron is classified as dormant.
-        stagnant_threshold: float = 0.25,  # Update/utilization threshold for classifying a neuron as stagnant.
-        volatile_threshold: float = 4.0,  # Upper update/utilization threshold for classifying a neuron as volatile.
-        rua_eps: float = 1e-8,  # Numerical floor used by relative-update calculations.
+        replacement_enabled:bool = False, # TODO: Neuron replacement for injecting plasticity on or off. 
+        replacement_strategy: Literal["cbp"] = "cbp", # TODO: specify replacement strategy
+
+        replacement_rate: float = 1e-5,
+        maturity_threshold: int = 1,
         activation_window_size: int = 10000,  # Number of recent activations retained for distribution statistics.
-        rollout_samples_per_forward: int | None = None,  # Cap rows taken from a single rollout forward pass (e.g. [num_envs, hidden]) before adding to the window. None = no subsampling.
-        compute_rank: bool = True,  # Whether to compute rank-based feature diagnostics.
+
         log_interval: int = 10,  # summary() calls (= epochs) between logged summaries. Alarm 1
         rank_interval: int = 50,  # summary() calls (= epochs) between rank calculations. Alarm 2
         knife_interval: int = 1,  # Multiple of log_interval between knife diagnostics. Alarm 3
+
+        utility_decay: float = 0.99,  # Exponential decay applied to the running utility estimate.
+
+        stagnant_threshold: float = 0.25,  # Update/utilization threshold for classifying a neuron as stagnant.
+        volatile_threshold: float = 4.0,  # Upper update/utilization threshold for classifying a neuron as volatile.
+        rua_eps: float = 1e-8,  # Numerical floor used by relative-update calculations.
+       
+        activity_threshold: float = 1e-5,  # Minimum activation magnitude counted as neuron activity.
+        dormant_threshold: float = 0.1,  # Activity ratio below which a neuron is classified as dormant.
+
+        replacement_accumulate:bool = False,
+        compute_rank: bool = True,  # Whether to compute rank-based feature diagnostics.
+        training_only: bool = True,  # Restricts collection to training mode when enabled.
+        
+        rollout_samples_per_forward: int | None = None,  # Cap rows taken from a single rollout forward pass (e.g. [num_envs, hidden]) before adding to the window. None = no subsampling.
+
+        init: str = "kaiming",
+        activation_name: str = "relu"
     ) -> None:
         self.model = model
         self.optimizer = optimizer
