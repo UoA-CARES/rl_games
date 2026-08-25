@@ -1,5 +1,6 @@
 import copy
 import os
+from typing import List
 
 from rl_games.common import vecenv
 
@@ -12,6 +13,7 @@ from rl_games.common.interval_summary_writer import IntervalSummaryWriter
 from rl_games.common.diagnostics import DefaultDiagnostics, PpoDiagnostics
 from rl_games.algos_torch import  model_builder
 from rl_games.interfaces.base_algorithm import  BaseAlgorithm
+from rl_games.algos_torch.plasticity import NetworkPlasticityManager, linear_consumers
 import numpy as np
 import time
 import gym
@@ -58,6 +60,34 @@ def print_statistics(print_stats, curr_frames, step_time, step_inference_time, t
             print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f}/{max_epochs:.0f} frames: {frame:.0f}')
         else:
             print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f}/{max_epochs:.0f} frames: {frame:.0f}/{max_frames:.0f}')
+
+
+# Keys accepted inside the config's `plasticity:` block. Everything except
+# 'enabled' is forwarded verbatim to NetworkPlasticityManager - the whitelist
+# exists so that a typo in the YAML raises an error naming the key, instead of
+# being silently dropped.
+PLASTICITY_CONFIG_KEYS = (
+    'replacement_enabled',
+    'replacement_strategy',
+    'replacement_rate',
+    'maturity_threshold',
+    'activation_window_size',
+    'log_interval',
+    'rank_interval',
+    'knife_interval',
+    'utility_decay',
+    'stagnant_threshold',
+    'volatile_threshold',
+    'rua_eps',
+    'activity_threshold',
+    'dormant_threshold',
+    'rollout_samples_per_forward',
+    'replacement_accumulate',
+    'compute_rank',
+    'training_only',
+    'init',
+    'activation_name',
+)
 
 
 class A2CBase(BaseAlgorithm):
@@ -304,6 +334,25 @@ class A2CBase(BaseAlgorithm):
         # soft augmentation not yet supported
         assert not self.has_soft_aug
 
+        ## Plasticity ----------------------------------------------------------------------------
+        # Managers can't be built here - self.model and self.optimizer don't
+        # exist until the concrete agent's __init__ runs. Only the config is
+        # read now, so the guard below fails before a whole model is built;
+        # init_plasticity() does the construction (see below).
+        self.plasticity_config = config.get('plasticity', None) or {}
+        self.plasticity_enabled = bool(self.plasticity_config.get('enabled', False))
+
+        # One entry per managed trunk: 1 for a shared trunk, 2 when the network
+        # uses separate actor/critic trunks. Empty whenever plasticity is off,
+        # so every consumer of it is a no-op without needing its own guard.
+        self.plasticity_managers: List[NetworkPlasticityManager] = []
+
+        if self.plasticity_enabled and self.plasticity_config.get('replacement_enabled', False):
+            raise NotImplementedError(
+                'config.plasticity.replacement_enabled is not implemented yet (CBP neuron '
+                'replacement is a later step). Set it to false to run diagnostics only.'
+            )
+
     def trancate_gradients_and_step(self):
         if self.multi_gpu:
             # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220
@@ -340,6 +389,139 @@ class A2CBase(BaseAlgorithm):
             network = builder.load(params['config']['central_value_config'])
             self.config['central_value_config']['network'] = network
 
+    def _plasticity_manager_kwargs(self):
+        """Validate the config's `plasticity:` block and turn it into kwargs.
+
+        Unknown keys are rejected here rather than at the manager's call site:
+        NetworkPlasticityManager takes no **kwargs, so a YAML typo would
+        otherwise surface as a bare TypeError from a constructor the user never
+        wrote.
+        """
+        unknown = sorted(set(self.plasticity_config) - {'enabled'} - set(PLASTICITY_CONFIG_KEYS))
+        if unknown:
+            raise ValueError(
+                'Unknown key(s) in config.plasticity: {}. Supported keys: {}.'.format(
+                    ', '.join(unknown), ', '.join(('enabled',) + PLASTICITY_CONFIG_KEYS)
+                )
+            )
+        return {key: value for key, value in self.plasticity_config.items() if key != 'enabled'}
+
+    def init_plasticity(self):
+        """Attach NetworkPlasticityManager(s) to the already-built model.
+
+        Called by the concrete agents (a2c_continuous/a2c_discrete) right after
+        self.model and self.optimizer exist, and before restore() - A2CBase's
+        own __init__ runs before either is built, so construction can't happen
+        there, but the logic lives here so both algorithms share it.
+        """
+        if not self.plasticity_enabled:
+            return
+
+        manager_kwargs = self._plasticity_manager_kwargs()
+        network = self.model.a2c_network
+
+        if not hasattr(network, 'actor_mlp'):
+            raise NotImplementedError(
+                'config.plasticity is only supported for the "actor_critic" (A2CBuilder) '
+                'network; got {} which has no actor_mlp trunk.'.format(type(network).__name__)
+            )
+        if getattr(network, 'has_rnn', False) or getattr(network, 'is_d2rl', False):
+            raise NotImplementedError(
+                'config.plasticity does not support RNN or D2RL networks yet - site discovery '
+                'cannot tell which layer consumes a trunk unit in those shapes.'
+            )
+
+        value_consumers = linear_consumers(network.get_value_layer())
+        action_consumers = []
+        if getattr(network, 'is_continuous', False):
+            action_consumers += linear_consumers(network.mu)
+            # sigma only reads the trunk when fixed_sigma is False; otherwise
+            # it's a free nn.Parameter with no weight column tied to a unit.
+            if not network.fixed_sigma:
+                action_consumers += linear_consumers(network.sigma)
+        else:
+            action_consumers += linear_consumers(network.logits)
+
+        if getattr(network, 'separate', False):
+            # Two independent trunks: each head may only be attributed to the
+            # trunk it actually reads. Handing both trunks to a single manager
+            # would let equal-width trunks claim each other's heads, since sites
+            # match external consumers by in_features alone.
+            trunks = [
+                ('actor', network.actor_mlp, action_consumers),
+                ('critic', network.critic_mlp, value_consumers),
+            ]
+        else:
+            trunks = [('shared', network.actor_mlp, action_consumers + value_consumers)]
+
+        for name, trunk, consumers in trunks:
+            manager = NetworkPlasticityManager(
+                model=trunk,
+                optimizer=self.optimizer,
+                output_consumers=consumers,
+                name=name,
+                enabled=True,
+                **manager_kwargs
+            )
+
+            if not manager.sites:
+                print('Plasticity: no feature sites discovered in "{}" trunk, skipping'.format(name))
+                manager.close()
+                continue
+
+            # Printed once at startup: the cheapest way to confirm the trunk's
+            # *final* hidden layer was picked up, which only happens if the
+            # output_consumers fallback matched a head above.
+            print('Plasticity: tracking {} site(s) in "{}" trunk: {}'.format(
+                len(manager.sites), name, ', '.join(site.name for site in manager.sites)))
+            self.plasticity_managers.append(manager)
+
+    def _restore_plasticity_state(self, saved):
+        """Restore per-trunk plasticity diagnostics from a checkpoint.
+
+        Called from set_full_state_weights. State is always restored when it is
+        there - there is no config key for this. Every mismatch path reports and
+        starts that manager fresh, and nothing here may raise: losing
+        diagnostics continuity is a nuisance, but taking down an otherwise
+        perfectly resumable run over it would not be.
+
+        The managers themselves need no re-pointing after a restore - see
+        NetworkPlasticityManager.load_state_dict for why the model/optimizer
+        references and the registered hooks all survive it.
+
+        Touches nothing but self.plasticity_managers, so it stays testable
+        against a stub without standing up a whole agent.
+        """
+        if not self.plasticity_managers:
+            if saved:
+                print('Plasticity: checkpoint carries plasticity state but plasticity is not '
+                      'active in this run - ignoring it.')
+            return
+
+        if not saved:
+            print('Plasticity: checkpoint has no plasticity state (saved before it was '
+                  'added?) - diagnostics restart from zero.')
+            return
+
+        for manager in self.plasticity_managers:
+            entry = saved.get(manager.name)
+            if entry is None:
+                print('Plasticity: no saved state for "{}" trunk (checkpoint has: {}) - '
+                      'starting fresh.'.format(manager.name, ', '.join(sorted(saved)) or 'none'))
+                continue
+
+            if manager.load_state_dict(entry):
+                # site_states is empty until a hook has actually fired, so
+                # "0 site state(s)" is the expected line today - the capture
+                # contexts are not wired into the training loop yet.
+                print('Plasticity: restored "{}" trunk (step_count={}, {} site state(s)).'.format(
+                    manager.name, manager.step_count, len(manager.site_states)))
+
+        unused = sorted(set(saved) - {manager.name for manager in self.plasticity_managers})
+        if unused:
+            print('Plasticity: checkpoint had unused plasticity state for: {}.'.format(
+                ', '.join(unused)))
+
     def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
         # do we need scaled time?
         self.diagnostics.send_info(self.writer)
@@ -359,6 +541,14 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('info/kl', torch_ext.mean_list(kls).item(), frame)
         self.writer.add_scalar('info/epochs', epoch_num, frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
+
+        # Plasticity diagnostics (Step 2e). plasticity_managers is empty
+        # whenever plasticity is disabled or unconfigured, so this costs
+        # nothing for agents that don't use it. mgr.summary()'s own keys
+        # already include mgr.name as a prefix, so we don't repeat it here.
+        for mgr in self.plasticity_managers:
+            for key, value in mgr.summary().items():
+                self.writer.add_scalar(f'plasticity/{key}', value, frame)
 
     def set_eval(self):
         self.model.eval()
@@ -601,6 +791,18 @@ class A2CBase(BaseAlgorithm):
             env_state = self.vec_env.get_env_state()
             state['env_state'] = env_state
 
+        # Plasticity diagnostics, one entry per managed trunk keyed by manager
+        # name ('actor'/'critic' or 'shared' - init_plasticity guarantees these
+        # are unique). Omitted entirely when plasticity is off, so checkpoints
+        # from non-plasticity runs keep exactly the shape they have today.
+        # Deliberately not in get_weights(): that pair is also the self-play
+        # weight-sync path (self_play_manager) and the shape players read, and
+        # training-only diagnostics have no business on either.
+        if self.plasticity_managers:
+            state['plasticity'] = {
+                manager.name: manager.state_dict() for manager in self.plasticity_managers
+            }
+
         return state
 
     def set_full_state_weights(self, weights):
@@ -617,6 +819,13 @@ class A2CBase(BaseAlgorithm):
 
         if self.vec_env is not None:
             self.vec_env.set_env_state(env_state)
+
+        # Last on purpose. Nothing above depends on it, and two things argue for
+        # the end: the managers resolve their tensors' device from the trunk's
+        # weights, which should be read after the model has been restored; and a
+        # diagnostics-only feature must never be in a position to abort a resume
+        # of the weights that actually matter.
+        self._restore_plasticity_state(weights.get('plasticity', None))
 
     def get_weights(self):
         state = self.get_stats_weights()
