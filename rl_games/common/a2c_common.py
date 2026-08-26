@@ -1,5 +1,6 @@
 import copy
 import os
+from contextlib import nullcontext
 from typing import List
 
 from rl_games.common import vecenv
@@ -572,17 +573,31 @@ class A2CBase(BaseAlgorithm):
         #if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
 
+    # Step 2a: generic, plasticity-agnostic hooks. No-op here so every
+    # non-plasticity algorithm built on A2CBase (SAC, DQN, ...) is unaffected.
+    def plasticity_rollout_context(self):
+        """Overridden by A2CAgent to enter every attached manager's rollout
+        capture; a no-op here so non-plasticity-aware algorithms (SAC, DQN,
+        ...) built on A2CBase aren't coupled to plasticity."""
+        return nullcontext()
+
+    def plasticity_training_context(self):
+        """Overridden by A2CAgent to enter every attached manager's training
+        (forward+backward) capture; a no-op here for the same reason as
+        plasticity_rollout_context()."""
+        return nullcontext()
+
     def get_action_values(self, obs):
         processed_obs = self._preproc_obs(obs['obs'])
         self.model.eval()
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : processed_obs,
             'rnn_states' : self.rnn_states
         }
 
-        with torch.no_grad():
+        with self.plasticity_rollout_context(), torch.no_grad():  # Step 2b: rollout capture
             res_dict = self.model(input_dict)
             if self.has_central_value:
                 states = obs['states']
