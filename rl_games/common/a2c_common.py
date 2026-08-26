@@ -802,6 +802,15 @@ class A2CBase(BaseAlgorithm):
         # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
         state['last_mean_rewards'] = float(self.last_mean_rewards)
 
+        # Scheduler state. Without these the adaptive schedule silently restarts from
+        # the config values on resume: the optimizer's param_groups come back correct
+        # via its state_dict, but the first scheduler.update() of the resumed run feeds
+        # the stale self.last_lr back in and writes the result onto the optimizer.
+        # float() for the same reason as above - keep numpy scalars out of the
+        # checkpoint so it stays loadable with weights_only=True.
+        state['last_lr'] = float(self.last_lr)
+        state['entropy_coef'] = float(self.entropy_coef)
+
         if self.vec_env is not None:
             env_state = self.vec_env.get_env_state()
             state['env_state'] = env_state
@@ -829,6 +838,14 @@ class A2CBase(BaseAlgorithm):
         self.optimizer.load_state_dict(weights['optimizer'])
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
+
+        # Defaults keep checkpoints written before these keys existed behaving exactly
+        # as they did: fall back to the config-derived values set in __init__.
+        self.last_lr = weights.get('last_lr', self.last_lr)
+        self.entropy_coef = weights.get('entropy_coef', self.entropy_coef)
+        # No update_lr() here on purpose. optimizer.load_state_dict() above already
+        # restored the saved lr into param_groups, and for a pre-'last_lr' checkpoint
+        # forcing the config default onto the optimizer would be a regression.
 
         env_state = weights.get('env_state', None)
 
@@ -1180,7 +1197,9 @@ class DiscreteA2CBase(A2CBase):
 
     def train(self):
         self.init_tensors()
-        self.mean_rewards = self.last_mean_rewards = -100500
+        # last_mean_rewards is deliberately not reset here: __init__ already seeds it
+        # with the sentinel for a fresh run, and restore() runs before train(), so
+        # resetting would discard the "best ever" reward loaded from the checkpoint.
         start_time = time.time()
         total_time = 0
         rep_count = 0
@@ -1456,7 +1475,9 @@ class ContinuousA2CBase(A2CBase):
 
     def train(self):
         self.init_tensors()
-        self.last_mean_rewards = -100500
+        # last_mean_rewards is deliberately not reset here: __init__ already seeds it
+        # with the sentinel for a fresh run, and restore() runs before train(), so
+        # resetting would discard the "best ever" reward loaded from the checkpoint.
         start_time = time.time()
         total_time = 0
         rep_count = 0
