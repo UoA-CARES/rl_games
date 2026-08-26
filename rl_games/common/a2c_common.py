@@ -800,7 +800,7 @@ class A2CBase(BaseAlgorithm):
 
         # This is actually the best reward ever achieved. last_mean_rewards is perhaps not the best variable name
         # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
-        state['last_mean_rewards'] = self.last_mean_rewards
+        state['last_mean_rewards'] = float(self.last_mean_rewards)
 
         if self.vec_env is not None:
             env_state = self.vec_env.get_env_state()
