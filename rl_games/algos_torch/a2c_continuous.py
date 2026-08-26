@@ -66,6 +66,8 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.epoch_num += 1
         return self.epoch_num
 
+    # Step 2b: A2CAgent's override of the Step 2a hook - enters every
+    # attached manager's rollout capture (capture_metrics()).
     def plasticity_rollout_context(self):
         """Enter every attached manager's rollout-activation capture around
         the real rollout forward pass (see A2CBase.get_action_values)."""
@@ -76,6 +78,8 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             stack.enter_context(mgr.capture_metrics())
         return stack
 
+    # Step 2c: A2CAgent's override of the Step 2a hook - enters every
+    # attached manager's training capture (capture_training()).
     def plasticity_training_context(self):
         """Enter every attached manager's training (forward+backward)
         capture around the real training pass (see calc_gradients)."""
@@ -85,7 +89,6 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         for mgr in self.plasticity_managers:
             stack.enter_context(mgr.capture_training())
         return stack
-
 
     def save(self, fn):
         state = self.get_full_state_weights()
@@ -127,7 +130,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             if self.zero_rnn_on_done:
                 batch_dict['dones'] = input_dict['dones']            
 
-        with self.plasticity_training_context():
+        with self.plasticity_training_context():  # Step 2c: training capture
             with torch.cuda.amp.autocast(enabled=self.mixed_precision):
                 res_dict = self.model(batch_dict)
                 action_log_probs = res_dict['prev_neglogp']
