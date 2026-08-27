@@ -116,6 +116,12 @@ class UtilityState:
     bias_corrected: torch.Tensor
     mean_feature_activation: torch.Tensor
     age: torch.Tensor
+    # Deterministic fractional-count carry for replacement_accumulate=True
+    # (CBP Algorithm 1's c_i). Shape (1,), not (num_units,) - not a per-unit
+    # stat, so it is deliberately excluded from checkpoint round-tripping
+    # (see _STATE_SKIP_FIELDS) rather than forced through the per-unit shape
+    # check every other UtilityState field goes through.
+    replacement_accumulator: torch.Tensor
 
 
 @dataclass
@@ -153,12 +159,21 @@ class SiteSummary:
 # version it does not recognise rather than guessing at a partial match.
 PLASTICITY_STATE_VERSION = 1
 
-# Fields deliberately left out of the checkpoint, mapped to the factory that
-# rebuilds them empty on load. behaviour_chunks is the raw activation ring
-# buffer: a short-lived window that _reset_summary_windows already clears at
-# every log, and at the default activation_window_size it runs to tens of MB
-# per site. A resumed manager simply refills it.
-_STATE_SKIP_FIELDS = {'behaviour_chunks': list, 'behaviour_rows': int}
+# Fields deliberately left out of the checkpoint, mapped to a factory(device)
+# that rebuilds them empty on load. behaviour_chunks is the raw activation
+# ring buffer: a short-lived window that _reset_summary_windows already
+# clears at every log, and at the default activation_window_size it runs to
+# tens of MB per site. A resumed manager simply refills it.
+# replacement_accumulator (CBP Algorithm 1's c_i) is a sub-unit fractional
+# carry, not a real statistic worth persisting - losing at most a fraction
+# of a unit's worth of progress on resume is harmless, and skipping it here
+# avoids teaching the shape check below about a (1,)-shaped exception to the
+# per-unit (num_units,) shape every other UtilityState field must have.
+_STATE_SKIP_FIELDS = {
+    'behaviour_chunks': lambda device: [],
+    'behaviour_rows': lambda device: 0,
+    'replacement_accumulator': lambda device: torch.zeros(1, device=device),
+}
 
 # Nested dataclass fields, keyed by (owner, field). Anything not listed here
 # and not skipped is treated as a plain per-unit tensor.
@@ -226,7 +241,7 @@ def _load_state_tree(
 
         skip_factory = _STATE_SKIP_FIELDS.get(field.name)
         if skip_factory is not None:
-            kwargs[field.name] = skip_factory()
+            kwargs[field.name] = skip_factory(device)
             continue
 
         if field.name not in data:
@@ -298,7 +313,7 @@ class NetworkPlasticityManager:
         maturity_threshold: int = 1,
         activation_window_size: int = 10000,  # Number of recent activations retained for distribution statistics.
 
-        log_interval: int = 10,  # summary() calls (= epochs) between logged summaries. Alarm 1
+        log_interval: int = 1,  # summary() calls (= epochs) between logged summaries. Alarm 1
         rank_interval: int = 50,  # summary() calls (= epochs) between rank calculations. Alarm 2
         knife_interval: int = 1,  # Multiple of log_interval between knife diagnostics. Alarm 3
 
@@ -365,6 +380,12 @@ class NetworkPlasticityManager:
         self.log_interval = log_interval
         self.rank_interval = rank_interval
         self.knife_interval = knife_interval
+
+        self.replacement_enabled = replacement_enabled
+        self.replacement_strategy = replacement_strategy
+        self.replacement_rate = replacement_rate
+        self.maturity_threshold = maturity_threshold
+        self.replacement_accumulate = replacement_accumulate
 
         # 1b: matches the reference directly - a single counter incremented
         # once per summary() call (once per epoch, in both codebases), not
@@ -793,6 +814,7 @@ class NetworkPlasticityManager:
                 bias_corrected=zeros(),
                 mean_feature_activation=zeros(),
                 age=zeros(),
+                replacement_accumulator=torch.zeros(1, device=device),
             ),
             activity=ActivityState(
                 window=RunningAverageState(total=zeros(), count=zeros()),
@@ -929,6 +951,63 @@ class NetworkPlasticityManager:
         state.knife.window.count.add_(1.0)
         state.knife.lifetime.total.add_(update_activity)
         state.knife.lifetime.count.add_(1.0)
+
+    # =========================================================================
+    # Replacement (Step 2d) - CBP/GnT unit selection. Eligibility first: a
+    # unit only becomes a replacement candidate once it has been alive
+    # (age, incremented once per _update_activation_metrics call - see
+    # above) longer than maturity_threshold. Matches the cares_rl reference
+    # exactly: strict '>', not '>=', so a unit reset this step (age reset to
+    # 0) can never re-qualify on the very same step even if
+    # maturity_threshold is 0.
+    # =========================================================================
+
+    @torch.no_grad()
+    def _eligible_units_for_replacement(self, site: FeatureSite) -> torch.Tensor:
+        state = self.site_states.get(site.name)
+        if state is None:
+            return torch.empty(0, dtype=torch.long)
+
+        age = state.utility.age
+        return torch.where(age > self.maturity_threshold)[0]
+
+    # =========================================================================
+    # How many to replace this step, given who's eligible (CBP Algorithm 1's
+    # c_i). expected = replacement_rate * eligible_count is almost always a
+    # fraction of a unit; turned into a whole number one of two ways:
+    #   replacement_accumulate=True  - deterministic carry (state.utility.
+    #     replacement_accumulator, the paper's c_i): accumulate `expected`
+    #     every call, replace floor(accumulator) units, keep the remainder.
+    #     Same long-run rate, smoothed over time, no randomness.
+    #   replacement_accumulate=False - CARES' default: replace floor(expected)
+    #     unconditionally, then one Bernoulli draw on the leftover fraction
+    #     decides whether to round up by one more. Same long-run rate, but
+    #     with randomness in exactly which steps get the "extra" unit.
+    # Not in the original paper (Algorithm 1 only describes the accumulate
+    # path) - a CARES-specific alternative, kept for parity with CARES.
+    # =========================================================================
+
+    @torch.no_grad()
+    def _replacement_count(self, site: FeatureSite, eligible_indices: torch.Tensor) -> int:
+        num_eligible = eligible_indices.numel()
+        if num_eligible == 0:
+            return 0
+
+        expected = self.replacement_rate * num_eligible
+
+        if self.replacement_accumulate:
+            state = self.site_states[site.name]
+            accumulator = state.utility.replacement_accumulator
+            accumulator.add_(expected)
+            num_replace = int(accumulator.item())
+            accumulator.sub_(float(num_replace))
+        else:
+            num_replace = int(expected)
+            fractional_part = expected - num_replace
+            if torch.rand((), device=eligible_indices.device).item() < fractional_part:
+                num_replace += 1
+
+        return min(num_replace, num_eligible)
 
     # =========================================================================
     # summary() - public entry point. Diagnostics at a step_count-driven
