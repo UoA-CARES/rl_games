@@ -2,6 +2,7 @@ from rl_games.common import a2c_common
 from rl_games.algos_torch import torch_ext
 
 from rl_games.algos_torch import central_value
+from rl_games.algos_torch.plasticity_adam import PlasticityAdam
 from rl_games.common import common_losses
 from rl_games.common import datasets
 
@@ -31,7 +32,14 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.init_rnn_from_model(self.model)
         self.last_lr = float(self.last_lr)
         self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
-        self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        # 2f: PlasticityAdam only when replacement is actually on - it reaches
+        # into optimizer.state[parameter] and zeros per-unit step/exp_avg/
+        # exp_avg_sq slices on reset (see NetworkPlasticityManager._zero_
+        # optimizer_state_slice), which stock Adam's scalar step count can't
+        # express. Diagnostics-only mode keeps stock (fused) Adam - it
+        # shouldn't pay the custom-optimizer cost for a feature it doesn't use.
+        optimizer_cls = PlasticityAdam if self.plasticity_replacement_enabled else optim.Adam
+        self.optimizer = optimizer_cls(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
         self.init_plasticity()
 
         if self.has_central_value:

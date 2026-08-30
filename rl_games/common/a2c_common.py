@@ -348,10 +348,19 @@ class A2CBase(BaseAlgorithm):
         # so every consumer of it is a no-op without needing its own guard.
         self.plasticity_managers: List[NetworkPlasticityManager] = []
 
-        if self.plasticity_enabled and self.plasticity_config.get('replacement_enabled', False):
+        self.plasticity_replacement_enabled = bool(
+            self.plasticity_enabled and self.plasticity_config.get('replacement_enabled', False)
+        )
+
+        # Independent ranks could pick different units to replace, desyncing
+        # the model even with gradients synchronized - CBP replacement isn't
+        # safe under multi-GPU yet (see docs/PLASTICITY_INTEGRATION_STEPS.md,
+        # Step 2f). Diagnostics-only (replacement_enabled=False) is unaffected.
+        if self.plasticity_replacement_enabled and self.multi_gpu:
             raise NotImplementedError(
-                'config.plasticity.replacement_enabled is not implemented yet (CBP neuron '
-                'replacement is a later step). Set it to false to run diagnostics only.'
+                'config.plasticity.replacement_enabled is not supported with multi_gpu=True yet '
+                '(CBP replacement is not synchronized across ranks). Set replacement_enabled to '
+                'false to run diagnostics only, or disable multi_gpu.'
             )
 
     def trancate_gradients_and_step(self):
@@ -378,6 +387,15 @@ class A2CBase(BaseAlgorithm):
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
+
+        # 2d: right after the optimizer actually updates weights - so a reset
+        # unit's fresh weights are never touched by a stale pre-reset gradient
+        # still in flight. Fires once per combined optimizer step (rl_games
+        # runs actor+critic through one shared optimizer), not once per
+        # network, even when output_consumers differ between heads.
+        if self.plasticity_replacement_enabled:
+            for mgr in self.plasticity_managers:
+                mgr.on_optimizer_step()
 
     def load_networks(self, params):
         builder = model_builder.ModelBuilder()

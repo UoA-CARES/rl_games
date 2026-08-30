@@ -310,7 +310,7 @@ class NetworkPlasticityManager:
         replacement_strategy: Literal["cbp"] = "cbp", # TODO: specify replacement strategy
 
         replacement_rate: float = 1e-5,
-        maturity_threshold: int = 1,
+        maturity_threshold: int = 5000,
         activation_window_size: int = 10000,  # Number of recent activations retained for distribution statistics.
 
         log_interval: int = 1,  # summary() calls (= epochs) between logged summaries. Alarm 1
@@ -386,11 +386,18 @@ class NetworkPlasticityManager:
         self.replacement_rate = replacement_rate
         self.maturity_threshold = maturity_threshold
         self.replacement_accumulate = replacement_accumulate
+        self.init = init
+        self.activation_name = activation_name
 
         # 1b: matches the reference directly - a single counter incremented
         # once per summary() call (once per epoch, in both codebases), not
         # a frame-based counter. See class docstring and docs/PLASTICITY_STEP_1.md.
         self.step_count = 0
+
+        # Separate, unrelated counter (2d): drives replacement cadence, once
+        # per optimizer step, not once per epoch. See on_optimizer_step.
+        self.optimizer_steps = 0
+        self.total_units_replaced = 0
 
         self.sites: list[FeatureSite] = []
         self.handles: list[Any] = []
@@ -1008,6 +1015,196 @@ class NetworkPlasticityManager:
                 num_replace += 1
 
         return min(num_replace, num_eligible)
+
+    # =========================================================================
+    # Which units, given who's eligible (_eligible_units_for_replacement) and
+    # how many (_replacement_count): the N lowest-contribution_utility units
+    # among the eligible pool. This is the entry point _reset_unit (below)
+    # consumes - it only returns indices, nothing here mutates weights,
+    # optimizer state, or tracked metrics.
+    # =========================================================================
+
+    @torch.no_grad()
+    def _select_units_by_cbp_utility(self, site: FeatureSite) -> torch.Tensor:
+        if self.replacement_strategy != "cbp":
+            raise NotImplementedError(
+                'replacement_strategy={!r} is not implemented. Currently '
+                'supported: "cbp"'.format(self.replacement_strategy)
+            )
+
+        eligible_indices = self._eligible_units_for_replacement(site)
+        num_replace = self._replacement_count(site, eligible_indices)
+        if num_replace == 0:
+            return torch.empty(0, dtype=torch.long, device=eligible_indices.device)
+
+        state = self.site_states[site.name]
+        eligible_utility = state.utility.bias_corrected[eligible_indices]
+        _, relative_indices = torch.topk(eligible_utility, k=num_replace, largest=False)
+        return eligible_indices[relative_indices]
+
+    # =========================================================================
+    # Reset mechanics (Step 6). Ported from cares_reinforcement_learning's
+    # _reset_unit/_reset_linear_output_unit/_initialization_bound/
+    # _reset_optimizer_state_for_unit/_zero_optimizer_state_slice - see
+    # docs/PLASTICITY_IN_CARES_RL.md. The one structural adaptation: rl_games'
+    # FeatureSite.consumer_modules is a tuple (1a - mu/value both read the
+    # trunk's last hidden layer), where the reference has a single
+    # consumer_module, so every consumer-side step below loops over all of
+    # them instead of touching one.
+    # =========================================================================
+
+    @torch.no_grad()
+    def _reset_unit(self, site: FeatureSite, unit_idx: int) -> None:
+        producer = site.producer_module
+        state = self.site_states[site.name]
+
+        if not site.consumer_modules:
+            return
+
+        # Fold this unit's expected contribution into each consumer's bias
+        # before zeroing its weight column, so removing it doesn't cause a
+        # discontinuous jump in that consumer's output. Uses the same
+        # bias-corrected mean activation the utility EMA itself uses, read
+        # before any of this unit's tracked state gets reset below.
+        decay = self.utility_decay
+        age = state.utility.age[unit_idx]
+        bias_correction = max(1.0 - decay ** age.item(), 1e-12)
+        bias_corrected_mean_feature = (
+            state.utility.mean_feature_activation[unit_idx] / bias_correction
+        )
+
+        for consumer in site.consumer_modules:
+            if consumer.bias is not None:
+                consumer.bias.data += (
+                    consumer.weight.data[:, unit_idx] * bias_corrected_mean_feature
+                )
+            consumer.weight.data[:, unit_idx] = 0.0
+
+        self._reset_linear_output_unit(producer, unit_idx)
+
+        state.utility.ema[unit_idx] = 0.0
+        state.utility.bias_corrected[unit_idx] = 0.0
+        state.utility.mean_feature_activation[unit_idx] = 0.0
+        state.utility.age[unit_idx] = 0.0
+
+        state.activity.window.total[unit_idx] = 0.0
+        state.activity.window.count[unit_idx] = 0.0
+        state.activity.lifetime.total[unit_idx] = 0.0
+        state.activity.lifetime.count[unit_idx] = 0.0
+
+        state.redo.activation_abs_ema[unit_idx] = 0.0
+        state.redo.activity_fraction_ema[unit_idx] = 0.0
+
+        state.knife.window.total[unit_idx] = 0.0
+        state.knife.window.count[unit_idx] = 0.0
+        state.knife.lifetime.total[unit_idx] = 0.0
+        state.knife.lifetime.count[unit_idx] = 0.0
+
+        self._reset_optimizer_state_for_unit(site, unit_idx)
+
+    @torch.no_grad()
+    def _reset_linear_output_unit(self, layer: nn.Linear, unit_idx: int) -> None:
+        bound = self._initialization_bound(layer)
+
+        layer.weight.data[unit_idx, :] = torch.empty(
+            layer.in_features,
+            device=layer.weight.device,
+            dtype=layer.weight.dtype,
+        ).uniform_(-bound, bound)
+
+        if layer.bias is not None:
+            layer.bias.data[unit_idx] = 0.0
+
+    def _initialization_bound(self, layer: nn.Linear) -> float:
+        init = self.init.lower()
+        activation_name = self.activation_name.lower()
+
+        if activation_name in ("swish", "silu", "elu", "golu"):
+            activation_name = "relu"
+
+        if init == "default":
+            return float((1.0 / layer.in_features) ** 0.5)
+
+        if init == "xavier":
+            gain = nn.init.calculate_gain(activation_name)
+            return float(gain * (6.0 / (layer.in_features + layer.out_features)) ** 0.5)
+
+        if init == "lecun":
+            return float((3.0 / layer.in_features) ** 0.5)
+
+        # Fallback (includes our default, "kaiming"): this is the Kaiming-
+        # uniform bound, gain * sqrt(3 / fan_in).
+        gain = nn.init.calculate_gain(activation_name)
+        return float(gain * (3.0 / layer.in_features) ** 0.5)
+
+    @torch.no_grad()
+    def _reset_optimizer_state_for_unit(self, site: FeatureSite, unit_idx: int) -> None:
+        producer = site.producer_module
+
+        self._zero_optimizer_state_slice(producer.weight, (unit_idx, slice(None)))
+
+        if producer.bias is not None:
+            self._zero_optimizer_state_slice(producer.bias, (unit_idx,))
+
+        for consumer in site.consumer_modules:
+            self._zero_optimizer_state_slice(consumer.weight, (slice(None), unit_idx))
+
+    @torch.no_grad()
+    def _zero_optimizer_state_slice(
+        self,
+        parameter: nn.Parameter,
+        index: tuple[Any, ...],
+    ) -> None:
+        state = self.optimizer.state.get(parameter)
+        if not state:
+            return
+
+        for value in state.values():
+            if not torch.is_tensor(value):
+                continue
+            if value.ndim == 0:
+                continue
+            try:
+                value[index] = 0.0
+            except (IndexError, RuntimeError):
+                continue
+
+    # =========================================================================
+    # on_optimizer_step() - public entry point (2d), the site-looping
+    # orchestrator: cares_rl's step_replacement() equivalent. Ties selection
+    # (_select_units_by_cbp_utility) and reset (_reset_unit) together across
+    # every discovered site. Call once per real optimizer step, right after
+    # the optimizer actually updates weights (see docs/PLASTICITY_INTEGRATION_
+    # STEPS.md Step 2d) - never before, so a reset unit's fresh weights are
+    # never touched by a stale pre-reset gradient still in flight.
+    # optimizer_steps is a separate counter from step_count/summary()'s
+    # logging cadence - this one drives replacement, once per optimizer
+    # step, not once per epoch.
+    # =========================================================================
+
+    @torch.no_grad()
+    def on_optimizer_step(self) -> dict[str, float]:
+        self.optimizer_steps += 1
+
+        if not self.enabled or not self.replacement_enabled:
+            return {}
+
+        total_replaced = 0
+        for site in self.sites:
+            if not site.consumer_modules:
+                continue
+
+            unit_indices = self._select_units_by_cbp_utility(site)
+            for unit_idx_tensor in unit_indices:
+                self._reset_unit(site, int(unit_idx_tensor.item()))
+                total_replaced += 1
+
+        self.total_units_replaced += total_replaced
+
+        return {
+            'units_replaced': float(total_replaced),
+            'units_replaced_total': float(self.total_units_replaced),
+        }
 
     # =========================================================================
     # summary() - public entry point. Diagnostics at a step_count-driven
