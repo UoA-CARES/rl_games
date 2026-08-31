@@ -1,5 +1,6 @@
 import copy
 import os
+import warnings
 from contextlib import nullcontext
 from typing import List
 
@@ -432,6 +433,13 @@ class A2CBase(BaseAlgorithm):
         self.model and self.optimizer exist, and before restore() - A2CBase's
         own __init__ runs before either is built, so construction can't happen
         there, but the logic lives here so both algorithms share it.
+
+        The structural assumptions below (actor_mlp trunk, mu/sigma/value as
+        siblings of it, no rnn/d2rl) are read off network_builder.py's
+        A2CBuilder as of plasticity.PLASTICITY_BASE_COMMIT - this fork has no
+        __version__ to assert against, so that constant is the documented
+        pin. A future rebase of the fork should re-check this method and
+        _discover_sites against whatever A2CBuilder looks like then.
         """
         if not self.plasticity_enabled:
             return
@@ -812,6 +820,13 @@ class A2CBase(BaseAlgorithm):
         state = self.get_weights()
         state['epoch'] = self.epoch_num
         state['optimizer'] = self.optimizer.state_dict()
+        # Lets set_full_state_weights warn on a PlasticityAdam <-> stock Adam
+        # mismatch instead of silently degrading (PlasticityAdam's per-unit
+        # 'step' tensor and stock Adam's scalar 'step' are structurally
+        # different; loading one into the other doesn't crash, it just quietly
+        # stops resetting 'step' on replacement - see plasticity.py's
+        # _zero_optimizer_state_slice).
+        state['optimizer_type'] = type(self.optimizer).__name__
         if self.has_central_value:
             state['assymetric_vf_nets'] = self.central_value_net.state_dict()
         state['frame'] = self.frame
@@ -853,6 +868,17 @@ class A2CBase(BaseAlgorithm):
         if self.has_central_value:
             self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
 
+        saved_optimizer_type = weights.get('optimizer_type')
+        live_optimizer_type = type(self.optimizer).__name__
+        if saved_optimizer_type is not None and saved_optimizer_type != live_optimizer_type:
+            warnings.warn(
+                'Checkpoint was saved with optimizer "{}" but this run is using "{}" '
+                '(plasticity.replacement_enabled differs between the checkpoint and this '
+                'config). Optimizer state will load, but per-unit step-tensor resets on '
+                'replacement silently stop working for state carried over from the '
+                'mismatched optimizer.'.format(saved_optimizer_type, live_optimizer_type),
+                stacklevel=2,
+            )
         self.optimizer.load_state_dict(weights['optimizer'])
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)

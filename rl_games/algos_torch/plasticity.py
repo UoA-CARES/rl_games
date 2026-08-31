@@ -38,6 +38,19 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 
+# Step 2f version-coupling guard. This fork (isaac-sim/rl_games, not upstream
+# Denys88/rl_games - see docs/PLASTICITY_INTEGRATION_STEPS.md) has no
+# rl_games.__version__ attribute at all, so there is nothing to assert
+# against at runtime. This constant is the documented substitute: the exact
+# commit this file's structural assumptions about A2CBuilder were read from
+# and validated against (network_builder.py's actor_mlp/mu/sigma/value shape
+# - see _discover_sites and a2c_common.init_plasticity). Deliberately not an
+# automated check - it exists so a future rebase/upgrade of the fork is a
+# conscious, visible "did the trunk/head shape change" step for whoever does
+# it, rather than silent structural drift nobody notices until diagnostics or
+# replacement start behaving strangely.
+PLASTICITY_BASE_COMMIT = '6b3534f29568158e9e29ec8bf83cc88fce5f0cae'
+
 SUPPORTED_TRAINABLE_LAYERS = (nn.Linear,)
 
 SUPPORTED_ACTIVATIONS = (
@@ -456,6 +469,14 @@ class NetworkPlasticityManager:
             'version': PLASTICITY_STATE_VERSION,
             'name': self.name,
             'step_count': int(self.step_count),
+            # 2d: optimizer_steps drives replacement cadence (once per real
+            # optimizer step, unrelated to step_count's once-per-epoch logging
+            # cadence); total_units_replaced is the lifetime counter surfaced
+            # in on_optimizer_step()'s return dict. Both are plain scalars,
+            # not per-unit state, so they need no shape validation like
+            # site_states does.
+            'optimizer_steps': int(self.optimizer_steps),
+            'total_units_replaced': int(self.total_units_replaced),
             # Topology, read off the discovered sites - available as soon as
             # _discover_sites() has run, independently of whether any hook ever
             # fired. This is what load_state_dict validates against.
@@ -566,6 +587,8 @@ class NetworkPlasticityManager:
         # no topology to check and nothing to restore beyond the cadence.
         if not saved_order and not saved_sites:
             self.step_count = int(state.get('step_count', 0))
+            self.optimizer_steps = int(state.get('optimizer_steps', 0))
+            self.total_units_replaced = int(state.get('total_units_replaced', 0))
             self.last_summary = {}
             return True
 
@@ -629,6 +652,8 @@ class NetworkPlasticityManager:
 
         self.site_states = rebuilt
         self.step_count = int(state.get('step_count', 0))
+        self.optimizer_steps = int(state.get('optimizer_steps', 0))
+        self.total_units_replaced = int(state.get('total_units_replaced', 0))
         self.last_summary = {}
         return True
 
