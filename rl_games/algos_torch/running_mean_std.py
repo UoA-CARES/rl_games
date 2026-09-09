@@ -30,6 +30,20 @@ class RunningMeanStd(nn.Module):
         self.register_buffer("running_var", torch.ones(in_size, dtype = torch.float64))
         self.register_buffer("count", torch.ones((), dtype = torch.float64))
 
+    def reset(self):
+        """Return the running statistics to their freshly-constructed state.
+
+        Warm-starting a policy onto a new reward function needs the *value*
+        normalizer discarded (the return scale it learned belongs to the old
+        reward) while the network weights around it are kept. The statistics
+        are buffers of this module, so they travel inside model.state_dict()
+        and cannot be dropped by omitting a checkpoint key - they have to be
+        overwritten in place after the load. Values mirror __init__ exactly.
+        """
+        self.running_mean.zero_()
+        self.running_var.fill_(1.0)
+        self.count.fill_(1.0)
+
     def _update_mean_var_count_from_moments(self, mean, var, count, batch_mean, batch_var, batch_count):
         delta = batch_mean - mean
         tot_count = count + batch_count

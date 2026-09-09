@@ -18,8 +18,34 @@ from rl_games.algos_torch import sac_agent
 
 
 def _restore(agent, args):
-    if 'checkpoint' in args and args['checkpoint'] is not None and args['checkpoint'] !='':
-        agent.restore(args['checkpoint'])
+    """Apply args['checkpoint'], as either a resume or a warm-start transfer.
+
+    Which one is not an argument of run(): the agent's own config.warm_start
+    block is the single source of truth, so a config that says "transfer" cannot
+    be silently defeated by a caller that forgot to pass a flag. Players carry no
+    such attribute, so the play path keeps resuming exactly as before.
+    """
+    checkpoint = args.get('checkpoint')
+    warm_start = getattr(agent, 'warm_start_enabled', False)
+
+    if warm_start and not checkpoint:
+        raise ValueError(
+            'config.warm_start.enabled is set but no checkpoint was provided - '
+            'warm start has nothing to transfer from.'
+        )
+
+    if not checkpoint:
+        return
+
+    if warm_start:
+        if not hasattr(agent, 'load_warmstart'):
+            raise NotImplementedError(
+                'warm start is not supported by {}; use a checkpoint resume instead '
+                '(config.warm_start.enabled: false).'.format(type(agent).__name__)
+            )
+        agent.load_warmstart(checkpoint)
+    else:
+        agent.restore(checkpoint)
 
 def _override_sigma(agent, args):
     if 'sigma' in args and args['sigma'] is not None:

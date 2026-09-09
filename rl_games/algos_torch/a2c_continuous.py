@@ -98,6 +98,15 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         checkpoint = torch_ext.load_checkpoint(fn)
         self.set_full_state_weights(checkpoint)
 
+    def load_warmstart(self, fn):
+        """Load the same checkpoint restore() reads, but as a transfer.
+
+        Which parts are applied is decided by config.warm_start; see
+        A2CBase.set_warmstart_weights.
+        """
+        checkpoint = torch_ext.load_checkpoint(fn)
+        self.set_warmstart_weights(checkpoint)
+
     def get_masked_action_values(self, obs, action_masks):
         assert False
 
