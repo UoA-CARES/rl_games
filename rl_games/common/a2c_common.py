@@ -15,6 +15,7 @@ from rl_games.common.diagnostics import DefaultDiagnostics, PpoDiagnostics
 from rl_games.algos_torch import  model_builder
 from rl_games.interfaces.base_algorithm import  BaseAlgorithm
 from rl_games.algos_torch.plasticity import NetworkPlasticityManager, linear_consumers
+from rl_games.algos_torch.running_mean_std import RunningMeanStd
 import numpy as np
 import time
 import gym
@@ -89,6 +90,31 @@ PLASTICITY_CONFIG_KEYS = (
     'init',
     'activation_name',
 )
+
+
+# Keys accepted inside the config's `warm_start:` block, which controls what a
+# transfer (as opposed to a resume) carries over from a checkpoint. Whitelisted
+# for the same reason as the plasticity block above: a YAML typo should name the
+# offending key rather than silently leave the default in place.
+WARM_START_CONFIG_KEYS = (
+    'reset_optimizer',
+    'reset_lr_schedule',
+    'reset_obs_normalizer',
+    'reset_value_normalizer',
+    'critic_warmup_epoch_count',
+)
+
+
+def _reset_running_mean_std(module):
+    """Reset every RunningMeanStd reachable from `module`, in place.
+
+    Walks submodules rather than touching the module directly so that
+    RunningMeanStdObs - an nn.ModuleDict of one RunningMeanStd per observation
+    key - is handled by the same call as a plain RunningMeanStd.
+    """
+    for sub in module.modules():
+        if isinstance(sub, RunningMeanStd):
+            sub.reset()
 
 
 class A2CBase(BaseAlgorithm):
@@ -353,6 +379,42 @@ class A2CBase(BaseAlgorithm):
                 'config.plasticity.replacement_enabled is not implemented yet (CBP neuron '
                 'replacement is a later step). Set it to false to run diagnostics only.'
             )
+
+        ## Warm start ----------------------------------------------------------------------------
+        # Warm start is a *transfer*: take a checkpoint trained under one reward
+        # function and continue under another. That is a different operation from
+        # resuming an interrupted run, which is what restore()/set_full_state_weights()
+        # do and which stays untouched. Only the config is read here; the load
+        # itself is set_warmstart_weights(), reached via load_warmstart().
+        # Validated in __init__ rather than at load time so a YAML typo fails
+        # before a whole model and environment have been built.
+        self.warm_start_config = config.get('warm_start', None) or {}
+        self.warm_start_enabled = bool(self.warm_start_config.get('enabled', False))
+
+        unknown = sorted(set(self.warm_start_config) - {'enabled'} - set(WARM_START_CONFIG_KEYS))
+        if unknown:
+            raise ValueError(
+                'Unknown key(s) in config.warm_start: {}. Supported keys: {}.'.format(
+                    ', '.join(unknown), ', '.join(('enabled',) + WARM_START_CONFIG_KEYS)
+                )
+            )
+
+        if int(self.warm_start_config.get('critic_warmup_epoch_count', 0)) != 0:
+            raise NotImplementedError(
+                'config.warm_start.critic_warmup_epoch_count is not implemented yet '
+                '(critic-only epochs after a transfer are a later step). Set it to 0.'
+            )
+
+        # Optimizer moments and the adaptive lr both belong to the old reward's
+        # optimisation problem, so they are dropped by default. The observation
+        # statistics are not: warm start changes the reward, not the environment
+        # or its observation space, and the transferred policy expects the inputs
+        # it was trained on. The value normalizer is the mirror image - the return
+        # scale follows the reward that just changed - so it defaults to a reset.
+        self.warm_start_reset_optimizer = bool(self.warm_start_config.get('reset_optimizer', True))
+        self.warm_start_reset_lr_schedule = bool(self.warm_start_config.get('reset_lr_schedule', True))
+        self.warm_start_reset_obs_normalizer = bool(self.warm_start_config.get('reset_obs_normalizer', False))
+        self.warm_start_reset_value_normalizer = bool(self.warm_start_config.get('reset_value_normalizer', True))
 
     def trancate_gradients_and_step(self):
         if self.multi_gpu:
@@ -800,7 +862,16 @@ class A2CBase(BaseAlgorithm):
 
         # This is actually the best reward ever achieved. last_mean_rewards is perhaps not the best variable name
         # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
-        state['last_mean_rewards'] = self.last_mean_rewards
+        state['last_mean_rewards'] = float(self.last_mean_rewards)
+
+        # Scheduler state. Without these the adaptive schedule silently restarts from
+        # the config values on resume: the optimizer's param_groups come back correct
+        # via its state_dict, but the first scheduler.update() of the resumed run feeds
+        # the stale self.last_lr back in and writes the result onto the optimizer.
+        # float() for the same reason as above - keep numpy scalars out of the
+        # checkpoint so it stays loadable with weights_only=True.
+        state['last_lr'] = float(self.last_lr)
+        state['entropy_coef'] = float(self.entropy_coef)
 
         if self.vec_env is not None:
             env_state = self.vec_env.get_env_state()
@@ -830,6 +901,14 @@ class A2CBase(BaseAlgorithm):
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
 
+        # Defaults keep checkpoints written before these keys existed behaving exactly
+        # as they did: fall back to the config-derived values set in __init__.
+        self.last_lr = weights.get('last_lr', self.last_lr)
+        self.entropy_coef = weights.get('entropy_coef', self.entropy_coef)
+        # No update_lr() here on purpose. optimizer.load_state_dict() above already
+        # restored the saved lr into param_groups, and for a pre-'last_lr' checkpoint
+        # forcing the config default onto the optimizer would be a regression.
+
         env_state = weights.get('env_state', None)
 
         if self.vec_env is not None:
@@ -840,6 +919,83 @@ class A2CBase(BaseAlgorithm):
         # weights, which should be read after the model has been restored; and a
         # diagnostics-only feature must never be in a position to abort a resume
         # of the weights that actually matter.
+        self._restore_plasticity_state(weights.get('plasticity', None))
+
+    def set_warmstart_weights(self, weights):
+        """Apply a checkpoint as a *transfer*, not as a resume.
+
+        Deliberately parallel to set_full_state_weights() rather than a variant
+        of it: resuming an interrupted run wants every last piece of state back,
+        while warm-starting onto a new reward function wants the network and
+        little else. Both read the same checkpoints - only the subset applied
+        differs - so set_full_state_weights() above is left exactly as it was.
+
+        Always taken: the model (which carries the normalizer buffers, see
+        below), the central value net, and the epoch/frame counters - callers
+        size their epoch budget against the inherited count.
+
+        Never taken:
+          * last_mean_rewards. It gates the "best ever" checkpoint save, and a
+            score earned under the previous reward function would suppress every
+            save of this run - leaving nothing for the next transfer to start
+            from.
+          * env_state. The warm-started run gets a fresh environment whose
+            reward function is a different one.
+
+        Optional, per config.warm_start (see WARM_START_CONFIG_KEYS).
+        """
+        # The AMP GradScaler's loss scale is optimizer-side state, so it goes
+        # with the optimizer. set_stats_weights() picks it up out of the same
+        # dict set_weights() is given, hence dropping the key rather than
+        # branching inside that shared method.
+        if self.warm_start_reset_optimizer and 'scaler' in weights:
+            model_weights = dict(weights)
+            model_weights.pop('scaler')
+        else:
+            model_weights = weights
+
+        self.set_weights(model_weights)
+
+        if self.has_central_value:
+            self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
+
+        # After BOTH loads above, not between them. Normalizer statistics are
+        # buffers of RunningMeanStd submodules, so they arrive inside the model
+        # blobs and are already in place by now - there is no checkpoint key to
+        # omit, and resetting one means overwriting the buffers. Doing that
+        # before the central value net is loaded would let its state dict put
+        # the old statistics straight back.
+        if self.warm_start_reset_obs_normalizer and self.normalize_input:
+            _reset_running_mean_std(self.model.running_mean_std)
+            if self.has_central_value:
+                _reset_running_mean_std(self.central_value_net.model.running_mean_std)
+        if self.warm_start_reset_value_normalizer and self.normalize_value:
+            # self.value_mean_std, not self.model.value_mean_std: with a central
+            # value net the former aliases that net's copy, and it is the module
+            # the training loop actually normalizes returns with.
+            _reset_running_mean_std(self.value_mean_std)
+
+        self.epoch_num = weights['epoch']
+        self.frame = weights.get('frame', 0)
+
+        if not self.warm_start_reset_optimizer:
+            self.optimizer.load_state_dict(weights['optimizer'])
+
+        if not self.warm_start_reset_lr_schedule:
+            self.last_lr = weights.get('last_lr', self.last_lr)
+            self.entropy_coef = weights.get('entropy_coef', self.entropy_coef)
+
+        # Unlike the resume path, this needs an explicit push onto the optimizer
+        # whenever either half was reset, because the two sources of the live lr
+        # disagree: optimizer.load_state_dict() restores the checkpoint's lr into
+        # param_groups, while self.last_lr may now hold the config value (or the
+        # reverse, with a fresh optimizer and a restored last_lr). Skipped only
+        # when nothing was reset, which is the resume-equivalent case and where
+        # set_full_state_weights() deliberately does not call update_lr() either.
+        if self.warm_start_reset_lr_schedule or self.warm_start_reset_optimizer:
+            self.update_lr(self.last_lr)
+
+        # Last, for the same reasons as in set_full_state_weights().
         self._restore_plasticity_state(weights.get('plasticity', None))
 
     def get_weights(self):
@@ -1180,7 +1336,9 @@ class DiscreteA2CBase(A2CBase):
 
     def train(self):
         self.init_tensors()
-        self.mean_rewards = self.last_mean_rewards = -100500
+        # last_mean_rewards is deliberately not reset here: __init__ already seeds it
+        # with the sentinel for a fresh run, and restore() runs before train(), so
+        # resetting would discard the "best ever" reward loaded from the checkpoint.
         start_time = time.time()
         total_time = 0
         rep_count = 0
@@ -1456,7 +1614,9 @@ class ContinuousA2CBase(A2CBase):
 
     def train(self):
         self.init_tensors()
-        self.last_mean_rewards = -100500
+        # last_mean_rewards is deliberately not reset here: __init__ already seeds it
+        # with the sentinel for a fresh run, and restore() runs before train(), so
+        # resetting would discard the "best ever" reward loaded from the checkpoint.
         start_time = time.time()
         total_time = 0
         rep_count = 0
