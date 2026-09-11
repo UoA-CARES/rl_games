@@ -399,11 +399,35 @@ class A2CBase(BaseAlgorithm):
                 )
             )
 
-        if int(self.warm_start_config.get('critic_warmup_epoch_count', 0)) != 0:
-            raise NotImplementedError(
-                'config.warm_start.critic_warmup_epoch_count is not implemented yet '
-                '(critic-only epochs after a transfer are a later step). Set it to 0.'
+        # Critic warmup: the transferred value function was fitted to the *old*
+        # reward, so the first updates after a transfer compute advantages from a
+        # stale baseline and push the policy - the one thing worth transferring -
+        # in an arbitrary direction. These epochs let the critic re-fit first,
+        # with the actor held still. See _set_critic_warmup for what "held still"
+        # means when the trunk is shared.
+        self.critic_warmup_epoch_count = int(self.warm_start_config.get('critic_warmup_epoch_count', 0))
+        if self.critic_warmup_epoch_count < 0:
+            raise ValueError(
+                'config.warm_start.critic_warmup_epoch_count must be >= 0, got {}.'.format(
+                    self.critic_warmup_epoch_count
+                )
             )
+        if self.critic_warmup_epoch_count > 0 and not self.warm_start_enabled:
+            raise ValueError(
+                'config.warm_start.critic_warmup_epoch_count is {} but '
+                'config.warm_start.enabled is false - there is no transfer to warm the '
+                'critic up after. Enable warm start or set the count to 0.'.format(
+                    self.critic_warmup_epoch_count
+                )
+            )
+
+        # Runtime state for the warmup window. Set here rather than in
+        # set_warmstart_weights so that cold starts, resumes and non-warm-start
+        # algorithms all have the attributes; the anchor stays None for them,
+        # which is what keeps the feature confined to transfers.
+        self.critic_warmup_until_epoch = None
+        self.critic_warmup_active = False
+        self._critic_warmup_saved_requires_grad = []
 
         # Optimizer moments and the adaptive lr both belong to the old reward's
         # optimisation problem, so they are dropped by default. The observation
@@ -419,6 +443,11 @@ class A2CBase(BaseAlgorithm):
     def trancate_gradients_and_step(self):
         if self.multi_gpu:
             # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220
+            # The flattened layout below only lines up across ranks because every
+            # rank skips the same params - grads are zeroed to None, so a frozen
+            # param contributes nothing. That holds for the critic warmup freeze
+            # because every rank reads the same config and the same restored
+            # epoch_num; a rank-dependent freeze would silently corrupt this.
             all_grads_list = []
             for param in self.model.parameters():
                 if param.grad is not None:
@@ -538,6 +567,104 @@ class A2CBase(BaseAlgorithm):
             print('Plasticity: tracking {} site(s) in "{}" trunk: {}'.format(
                 len(manager.sites), name, ', '.join(site.name for site in manager.sites)))
             self.plasticity_managers.append(manager)
+
+    def _critic_warmup_frozen_parameters(self):
+        """The parameters a critic-only epoch must hold still.
+
+        Expressed as "everything in the model that is not the critic" rather
+        than as a list of actor modules, because that is what makes the shared
+        trunk fall on the right side: with separate=False there is no separate
+        critic trunk, so actor_mlp *is* the trunk both heads read, and freezing
+        by subtraction leaves only the value head trainable - which is the point
+        of the warmup. It also catches sigma whether it is a Linear or the bare
+        nn.Parameter that fixed_sigma=True creates, which a module-name-based
+        list would miss.
+
+        RunningMeanStd statistics are untouched either way: they are not
+        optimized parameters, and normalizer updates run under no_grad, so
+        observation statistics keep tracking through the warmup.
+        """
+        network = self.model.a2c_network
+
+        if not hasattr(network, 'actor_mlp') or not hasattr(network, 'get_value_layer'):
+            raise NotImplementedError(
+                'config.warm_start.critic_warmup_epoch_count is only supported for the '
+                '"actor_critic" (A2CBuilder) network; got {} which has no actor_mlp trunk '
+                'and value layer to separate.'.format(type(network).__name__)
+            )
+
+        critic_modules = [network.get_value_layer()]
+        if getattr(network, 'separate', False):
+            # Two independent trunks: the critic's own trunk keeps training.
+            # With separate=False these attributes still exist as empty
+            # nn.Sequential()s, so there is nothing to add.
+            critic_modules.append(network.critic_mlp)
+            critic_modules.append(network.critic_cnn)
+            if getattr(network, 'has_rnn', False):
+                critic_modules.append(network.c_rnn)
+                if getattr(network, 'rnn_ln', False):
+                    critic_modules.append(network.c_layer_norm)
+
+        critic_params = {id(param) for module in critic_modules for param in module.parameters()}
+        return [param for param in self.model.parameters() if id(param) not in critic_params]
+
+    def _set_critic_warmup(self, active:bool):
+        """Enter or leave the critic-only window.
+
+        The original requires_grad flags are saved on entry and put back on
+        exit, rather than unconditionally setting True, so anything that was
+        already frozen for another reason stays frozen afterwards.
+        """
+        if active:
+            frozen = self._critic_warmup_frozen_parameters()
+            self._critic_warmup_saved_requires_grad = [
+                (param, param.requires_grad) for param in frozen
+            ]
+            for param in frozen:
+                param.requires_grad = False
+            trunk = 'shared trunk + actor head' if not getattr(
+                self.model.a2c_network, 'separate', False) else 'actor trunk + actor head'
+            print('Critic warmup: froze {} ({} parameter tensors) until epoch {}.'.format(
+                trunk, len(frozen), self.critic_warmup_until_epoch))
+        else:
+            for param, requires_grad in self._critic_warmup_saved_requires_grad:
+                param.requires_grad = requires_grad
+            print('Critic warmup: finished at epoch {}, actor unfrozen ({} parameter '
+                  'tensors).'.format(self.epoch_num - 1,
+                                     len(self._critic_warmup_saved_requires_grad)))
+            self._critic_warmup_saved_requires_grad = []
+
+        self.critic_warmup_active = active
+
+    def _update_critic_warmup_state(self):
+        """Toggle the warmup window for the epoch that is about to run.
+
+        critic_warmup_until_epoch is only ever set by set_warmstart_weights, so
+        this is a no-op for cold starts, plain resumes and any algorithm that
+        does not go through a transfer.
+        """
+        should_be_active = (
+            self.critic_warmup_until_epoch is not None
+            and self.epoch_num <= self.critic_warmup_until_epoch
+        )
+        if should_be_active != self.critic_warmup_active:
+            self._set_critic_warmup(should_be_active)
+
+    def _maybe_update_schedule(self, av_kls):
+        """Advance the lr/entropy schedule, unless the critic warmup is running.
+
+        During the warmup the policy is identical across mini-epochs, so the
+        measured KL is exactly 0. An adaptive scheduler reads that as "far below
+        the target KL" and raises the lr on every single mini-epoch, so the
+        actor would unfreeze onto a learning rate near lr_schedule_max - the
+        opposite of the stability the warmup exists to buy. The critic trains on
+        whatever lr the transfer left in place.
+        """
+        if self.critic_warmup_active:
+            return
+        self.last_lr, self.entropy_coef = self.scheduler.update(
+            self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls)
+        self.update_lr(self.last_lr)
 
     def _restore_plasticity_state(self, saved):
         """Restore per-trunk plasticity diagnostics from a checkpoint.
@@ -838,6 +965,10 @@ class A2CBase(BaseAlgorithm):
         pass
 
     def train_epoch(self):
+        # Before anything else in the epoch: update_epoch() has already bumped
+        # self.epoch_num by the time we get here, so this is the one place that
+        # sees the epoch number the rollout and the updates will run under.
+        self._update_critic_warmup_state()
         self.vec_env.set_train_info(self.frame, self)
 
     def train_actor_critic(self, obs_dict, opt_step=True):
@@ -977,6 +1108,14 @@ class A2CBase(BaseAlgorithm):
 
         self.epoch_num = weights['epoch']
         self.frame = weights.get('frame', 0)
+
+        # Anchored to the *restored* epoch, not to 0: a transfer inherits the
+        # checkpoint's epoch counter, so `epoch_num < count` would be false from
+        # the first epoch of every warm start after the very first iteration.
+        if self.critic_warmup_epoch_count > 0:
+            self.critic_warmup_until_epoch = self.epoch_num + self.critic_warmup_epoch_count
+            print('Critic warmup: epochs {}..{} will update the critic only.'.format(
+                self.epoch_num + 1, self.critic_warmup_until_epoch))
 
         if not self.warm_start_reset_optimizer:
             self.optimizer.load_state_dict(weights['optimizer'])
@@ -1261,8 +1400,7 @@ class DiscreteA2CBase(A2CBase):
                 dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
                 av_kls /= self.world_size
 
-            self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-            self.update_lr(self.last_lr)
+            self._maybe_update_schedule(av_kls.item())
             kls.append(av_kls)
             self.diagnostics.mini_epoch(self, mini_ep)
             if self.normalize_input:
@@ -1529,16 +1667,14 @@ class ContinuousA2CBase(A2CBase):
                     if self.multi_gpu:
                         dist.all_reduce(kl, op=dist.ReduceOp.SUM)
                         av_kls /= self.world_size
-                    self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-                    self.update_lr(self.last_lr)
+                    self._maybe_update_schedule(av_kls.item())
 
             av_kls = torch_ext.mean_list(ep_kls)
             if self.multi_gpu:
                 dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
                 av_kls /= self.world_size
             if self.schedule_type == 'standard':
-                self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-                self.update_lr(self.last_lr)
+                self._maybe_update_schedule(av_kls.item())
 
             kls.append(av_kls)
             self.diagnostics.mini_epoch(self, mini_ep)

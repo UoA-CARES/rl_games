@@ -67,6 +67,22 @@ class _Scaler:
         self.loaded = True
 
 
+class _Scheduler:
+    """Records whether the lr schedule was advanced, and always moves the lr.
+
+    A real adaptive scheduler with KL == 0 raises the lr, which is exactly the
+    behaviour the warmup must suppress; moving it unconditionally makes
+    "was update() reached" observable from last_lr alone.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def update(self, lr, entropy_coef, epoch, frames, kl):
+        self.calls += 1
+        return lr * 2.0, entropy_coef
+
+
 class _Agent:
     """Stand-in `self` for the unbound A2CBase methods under test."""
 
@@ -93,6 +109,14 @@ class _Agent:
         self.plasticity_managers = []
         self.multi_gpu = False
 
+        # Critic warmup state, as A2CBase.__init__ initialises it.
+        self.critic_warmup_epoch_count = warm_start.get('critic_warmup_epoch_count', 0)
+        self.critic_warmup_until_epoch = None
+        self.critic_warmup_active = False
+        self._critic_warmup_saved_requires_grad = []
+        self.has_value_loss = True
+        self.scheduler = _Scheduler()
+
         self.warm_start_reset_optimizer = warm_start.get('reset_optimizer', True)
         self.warm_start_reset_lr_schedule = warm_start.get('reset_lr_schedule', True)
         self.warm_start_reset_obs_normalizer = warm_start.get('reset_obs_normalizer', False)
@@ -108,6 +132,10 @@ class _Agent:
     get_stats_weights = A2CBase.get_stats_weights
     update_lr = A2CBase.update_lr
     _restore_plasticity_state = A2CBase._restore_plasticity_state
+    _critic_warmup_frozen_parameters = A2CBase._critic_warmup_frozen_parameters
+    _set_critic_warmup = A2CBase._set_critic_warmup
+    _update_critic_warmup_state = A2CBase._update_critic_warmup_state
+    _maybe_update_schedule = A2CBase._maybe_update_schedule
 
 
 def _feed(rms, value):
@@ -469,10 +497,16 @@ def _parse_warm_start_config(block):
                 ', '.join(unknown), ', '.join(('enabled',) + WARM_START_CONFIG_KEYS)
             )
         )
-    if int(block.get('critic_warmup_epoch_count', 0)) != 0:
-        raise NotImplementedError(
-            'config.warm_start.critic_warmup_epoch_count is not implemented yet '
-            '(critic-only epochs after a transfer are a later step). Set it to 0.'
+    count = int(block.get('critic_warmup_epoch_count', 0))
+    if count < 0:
+        raise ValueError(
+            'config.warm_start.critic_warmup_epoch_count must be >= 0, got {}.'.format(count)
+        )
+    if count > 0 and not bool(block.get('enabled', False)):
+        raise ValueError(
+            'config.warm_start.critic_warmup_epoch_count is {} but '
+            'config.warm_start.enabled is false - there is no transfer to warm the '
+            'critic up after. Enable warm start or set the count to 0.'.format(count)
         )
     return block
 
@@ -491,17 +525,32 @@ def test_every_documented_key_is_accepted():
                               for key in ('enabled',) + WARM_START_CONFIG_KEYS})
 
 
-def test_critic_warmup_epoch_count_is_not_implemented_yet():
-    try:
-        _parse_warm_start_config({'enabled': True, 'critic_warmup_epoch_count': 3})
-    except NotImplementedError as e:
-        assert 'critic_warmup_epoch_count' in str(e)
-    else:
-        assert False, 'expected NotImplementedError'
+def test_critic_warmup_epoch_count_is_accepted():
+    _parse_warm_start_config({'enabled': True, 'critic_warmup_epoch_count': 3})
 
 
 def test_critic_warmup_epoch_count_zero_is_accepted():
     _parse_warm_start_config({'enabled': True, 'critic_warmup_epoch_count': 0})
+
+
+def test_negative_critic_warmup_epoch_count_is_rejected():
+    try:
+        _parse_warm_start_config({'enabled': True, 'critic_warmup_epoch_count': -1})
+    except ValueError as e:
+        assert 'critic_warmup_epoch_count' in str(e)
+    else:
+        assert False, 'expected ValueError'
+
+
+def test_critic_warmup_without_warm_start_is_rejected():
+    # The window is anchored to the epoch a transfer restores, so asking for one
+    # without a transfer is a config mistake rather than a silent no-op.
+    try:
+        _parse_warm_start_config({'enabled': False, 'critic_warmup_epoch_count': 3})
+    except ValueError as e:
+        assert 'enabled' in str(e)
+    else:
+        assert False, 'expected ValueError'
 
 
 # --------------------------------------------------------------------------- #
@@ -574,3 +623,198 @@ def test_warm_start_on_an_agent_that_cannot_do_it():
         assert 'warm start is not supported' in str(e)
     else:
         assert False, 'expected NotImplementedError'
+
+
+# --------------------------------------------------------------------------- #
+# 12. Critic warmup                                                             #
+# --------------------------------------------------------------------------- #
+
+def _a2c_network(separate, fixed_sigma=True):
+    """A real A2CBuilder network, so the freeze is tested against real modules.
+
+    The partition is the whole point of the feature, and it turns on attributes
+    (`separate`, `fixed_sigma`, the empty critic_mlp when not separate) that only
+    the real builder produces.
+    """
+    from rl_games.algos_torch.network_builder import A2CBuilder
+
+    builder = A2CBuilder()
+    builder.load({
+        'separate': separate,
+        'mlp': {
+            'units': [8, 8],
+            'activation': 'elu',
+            'initializer': {'name': 'default'},
+        },
+        'space': {
+            'continuous': {
+                'mu_activation': 'None',
+                'sigma_activation': 'None',
+                'mu_init': {'name': 'default'},
+                'sigma_init': {'name': 'const_initializer', 'val': 0},
+                'fixed_sigma': fixed_sigma,
+            }
+        },
+    })
+    return builder.build('a2c', actions_num=2, input_shape=(OBS_SIZE,), num_seqs=1, value_size=1)
+
+
+class _NetworkAgent(_Agent):
+    """An _Agent whose model carries a real A2CBuilder network."""
+
+    def __init__(self, separate, fixed_sigma=True, **kwargs):
+        super().__init__(**kwargs)
+        self.model.a2c_network = _a2c_network(separate, fixed_sigma=fixed_sigma)
+
+
+def _trainable(agent):
+    return {name for name, param in agent.model.a2c_network.named_parameters()
+            if param.requires_grad}
+
+
+def test_warmup_anchor_is_relative_to_the_restored_epoch():
+    # The transfer inherits the checkpoint's epoch counter, so a window measured
+    # from 0 would already be over before the first epoch of any later iteration.
+    source = _trained_source()
+    source.epoch_num = 700
+    saved = source.save_state()
+
+    agent = _Agent(critic_warmup_epoch_count=10)
+    agent.load_warm(saved)
+
+    assert agent.epoch_num == 700
+    assert agent.critic_warmup_until_epoch == 710
+
+
+def test_no_anchor_without_a_warmup_count():
+    source = _trained_source()
+    source.epoch_num = 700
+    agent = _Agent(critic_warmup_epoch_count=0)
+    agent.load_warm(source.save_state())
+
+    assert agent.critic_warmup_until_epoch is None
+
+
+def test_warmup_state_machine_spans_exactly_the_window():
+    agent = _NetworkAgent(separate=False)
+    agent.critic_warmup_until_epoch = 705
+    agent.epoch_num = 700
+
+    seen = []
+    for epoch in range(701, 709):
+        agent.epoch_num = epoch
+        agent._update_critic_warmup_state()
+        seen.append(agent.critic_warmup_active)
+
+    # Epochs 701..705 are critic-only; 706 onwards are normal.
+    assert seen == [True] * 5 + [False] * 3
+
+
+def test_warmup_never_activates_without_an_anchor():
+    agent = _NetworkAgent(separate=False)
+    for epoch in range(1, 5):
+        agent.epoch_num = epoch
+        agent._update_critic_warmup_state()
+        assert not agent.critic_warmup_active
+
+
+def test_shared_trunk_freezes_the_trunk_and_leaves_only_the_value_head():
+    # The case the ARD tasks actually run: separate=False, so actor_mlp *is* the
+    # trunk both heads read, and a critic-only epoch may only move `value`.
+    agent = _NetworkAgent(separate=False)
+    agent.critic_warmup_until_epoch = 5
+    agent.epoch_num = 1
+    agent._update_critic_warmup_state()
+
+    assert agent.critic_warmup_active
+    assert _trainable(agent) == {'value.weight', 'value.bias'}
+
+
+def test_separate_trunks_keep_the_critic_trunk_trainable():
+    agent = _NetworkAgent(separate=True)
+    agent.critic_warmup_until_epoch = 5
+    agent.epoch_num = 1
+    agent._update_critic_warmup_state()
+
+    trainable = _trainable(agent)
+    assert {'value.weight', 'value.bias'} <= trainable
+    assert any(name.startswith('critic_mlp.') for name in trainable)
+    assert not any(name.startswith('actor_mlp.') for name in trainable)
+    assert not any(name.startswith('mu.') for name in trainable)
+    assert not any(name.startswith('sigma') for name in trainable)
+
+
+def test_fixed_sigma_parameter_is_frozen():
+    # fixed_sigma makes sigma a bare nn.Parameter rather than a Linear, which a
+    # module-name-based freeze would walk straight past.
+    for separate in (False, True):
+        agent = _NetworkAgent(separate=separate, fixed_sigma=True)
+        assert agent.model.a2c_network.sigma.requires_grad
+
+        agent.critic_warmup_until_epoch = 5
+        agent.epoch_num = 1
+        agent._update_critic_warmup_state()
+
+        assert not agent.model.a2c_network.sigma.requires_grad
+
+
+def test_unfreeze_restores_the_original_flags():
+    agent = _NetworkAgent(separate=False)
+    before = {name: param.requires_grad
+              for name, param in agent.model.named_parameters()}
+
+    agent.critic_warmup_until_epoch = 5
+    agent.epoch_num = 1
+    agent._update_critic_warmup_state()
+    agent.epoch_num = 6
+    agent._update_critic_warmup_state()
+
+    assert not agent.critic_warmup_active
+    after = {name: param.requires_grad
+             for name, param in agent.model.named_parameters()}
+    assert after == before
+
+
+def test_unfreeze_does_not_thaw_what_was_already_frozen():
+    agent = _NetworkAgent(separate=False)
+    agent.model.a2c_network.mu.weight.requires_grad = False
+
+    agent.critic_warmup_until_epoch = 5
+    agent.epoch_num = 1
+    agent._update_critic_warmup_state()
+    agent.epoch_num = 6
+    agent._update_critic_warmup_state()
+
+    assert not agent.model.a2c_network.mu.weight.requires_grad
+
+
+def test_schedule_is_frozen_during_warmup():
+    # KL is 0 by construction while the policy is held still, so an adaptive
+    # scheduler would ramp the lr through the whole window.
+    agent = _NetworkAgent(separate=False)
+    agent.critic_warmup_active = True
+    agent._maybe_update_schedule(0.0)
+
+    assert agent.scheduler.calls == 0
+    assert agent.last_lr == CONFIG_LR
+
+
+def test_schedule_advances_once_warmup_is_over():
+    agent = _NetworkAgent(separate=False)
+    agent.critic_warmup_active = False
+    agent._maybe_update_schedule(0.01)
+
+    assert agent.scheduler.calls == 1
+    assert agent.last_lr == CONFIG_LR * 2.0
+
+
+def test_unsupported_network_is_rejected_by_name():
+    # _Agent's plain nn.Linear stands in for any network without the
+    # actor_mlp/value split the freeze needs.
+    agent = _Agent()
+    try:
+        agent._critic_warmup_frozen_parameters()
+    except NotImplementedError as e:
+        assert 'critic_warmup_epoch_count' in str(e)
+    else:
+        assert False, 'expected NotImplementedError naming the unsupported network'
