@@ -1,5 +1,7 @@
 import copy
 import os
+from contextlib import nullcontext
+from typing import List
 
 from rl_games.common import vecenv
 
@@ -12,6 +14,8 @@ from rl_games.common.interval_summary_writer import IntervalSummaryWriter
 from rl_games.common.diagnostics import DefaultDiagnostics, PpoDiagnostics
 from rl_games.algos_torch import  model_builder
 from rl_games.interfaces.base_algorithm import  BaseAlgorithm
+from rl_games.algos_torch.plasticity import NetworkPlasticityManager, linear_consumers
+from rl_games.algos_torch.running_mean_std import RunningMeanStd
 import numpy as np
 import time
 import gym
@@ -58,6 +62,59 @@ def print_statistics(print_stats, curr_frames, step_time, step_inference_time, t
             print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f}/{max_epochs:.0f} frames: {frame:.0f}')
         else:
             print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f}/{max_epochs:.0f} frames: {frame:.0f}/{max_frames:.0f}')
+
+
+# Keys accepted inside the config's `plasticity:` block. Everything except
+# 'enabled' is forwarded verbatim to NetworkPlasticityManager - the whitelist
+# exists so that a typo in the YAML raises an error naming the key, instead of
+# being silently dropped.
+PLASTICITY_CONFIG_KEYS = (
+    'replacement_enabled',
+    'replacement_strategy',
+    'replacement_rate',
+    'maturity_threshold',
+    'activation_window_size',
+    'log_interval',
+    'rank_interval',
+    'knife_interval',
+    'utility_decay',
+    'stagnant_threshold',
+    'volatile_threshold',
+    'rua_eps',
+    'activity_threshold',
+    'dormant_threshold',
+    'rollout_samples_per_forward',
+    'replacement_accumulate',
+    'compute_rank',
+    'training_only',
+    'init',
+    'activation_name',
+)
+
+
+# Keys accepted inside the config's `warm_start:` block, which controls what a
+# transfer (as opposed to a resume) carries over from a checkpoint. Whitelisted
+# for the same reason as the plasticity block above: a YAML typo should name the
+# offending key rather than silently leave the default in place.
+WARM_START_CONFIG_KEYS = (
+    'reset_optimizer',
+    'reset_lr_schedule',
+    'reset_obs_normalizer',
+    'reset_value_normalizer',
+    'critic_warmup_epoch_count',
+)
+
+
+def _reset_running_mean_std(module):
+    """Reset every RunningMeanStd reachable from `module`, in place.
+
+    Walks submodules rather than touching the module directly so that
+    RunningMeanStdObs - an nn.ModuleDict of one RunningMeanStd per observation
+    key - is handled by the same call as a plain RunningMeanStd.
+    """
+    for sub in module.modules():
+        if isinstance(sub, RunningMeanStd):
+            sub.reset()
 
 
 class A2CBase(BaseAlgorithm):
@@ -304,6 +361,61 @@ class A2CBase(BaseAlgorithm):
         # soft augmentation not yet supported
         assert not self.has_soft_aug
 
+        ## Plasticity ----------------------------------------------------------------------------
+        # Managers can't be built here - self.model and self.optimizer don't
+        # exist until the concrete agent's __init__ runs. Only the config is
+        # read now, so the guard below fails before a whole model is built;
+        # init_plasticity() does the construction (see below).
+        self.plasticity_config = config.get('plasticity', None) or {}
+        self.plasticity_enabled = bool(self.plasticity_config.get('enabled', False))
+
+        # One entry per managed trunk: 1 for a shared trunk, 2 when the network
+        # uses separate actor/critic trunks. Empty whenever plasticity is off,
+        # so every consumer of it is a no-op without needing its own guard.
+        self.plasticity_managers: List[NetworkPlasticityManager] = []
+
+        if self.plasticity_enabled and self.plasticity_config.get('replacement_enabled', False):
+            raise NotImplementedError(
+                'config.plasticity.replacement_enabled is not implemented yet (CBP neuron '
+                'replacement is a later step). Set it to false to run diagnostics only.'
+            )
+
+        ## Warm start ----------------------------------------------------------------------------
+        # Warm start is a *transfer*: take a checkpoint trained under one reward
+        # function and continue under another. That is a different operation from
+        # resuming an interrupted run, which is what restore()/set_full_state_weights()
+        # do and which stays untouched. Only the config is read here; the load
+        # itself is set_warmstart_weights(), reached via load_warmstart().
+        # Validated in __init__ rather than at load time so a YAML typo fails
+        # before a whole model and environment have been built.
+        self.warm_start_config = config.get('warm_start', None) or {}
+        self.warm_start_enabled = bool(self.warm_start_config.get('enabled', False))
+
+        unknown = sorted(set(self.warm_start_config) - {'enabled'} - set(WARM_START_CONFIG_KEYS))
+        if unknown:
+            raise ValueError(
+                'Unknown key(s) in config.warm_start: {}. Supported keys: {}.'.format(
+                    ', '.join(unknown), ', '.join(('enabled',) + WARM_START_CONFIG_KEYS)
+                )
+            )
+
+        if int(self.warm_start_config.get('critic_warmup_epoch_count', 0)) != 0:
+            raise NotImplementedError(
+                'config.warm_start.critic_warmup_epoch_count is not implemented yet '
+                '(critic-only epochs after a transfer are a later step). Set it to 0.'
+            )
+
+        # Optimizer moments and the adaptive lr both belong to the old reward's
+        # optimisation problem, so they are dropped by default. The observation
+        # statistics are not: warm start changes the reward, not the environment
+        # or its observation space, and the transferred policy expects the inputs
+        # it was trained on. The value normalizer is the mirror image - the return
+        # scale follows the reward that just changed - so it defaults to a reset.
+        self.warm_start_reset_optimizer = bool(self.warm_start_config.get('reset_optimizer', True))
+        self.warm_start_reset_lr_schedule = bool(self.warm_start_config.get('reset_lr_schedule', True))
+        self.warm_start_reset_obs_normalizer = bool(self.warm_start_config.get('reset_obs_normalizer', False))
+        self.warm_start_reset_value_normalizer = bool(self.warm_start_config.get('reset_value_normalizer', True))
+
     def trancate_gradients_and_step(self):
         if self.multi_gpu:
             # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220
@@ -340,6 +452,139 @@ class A2CBase(BaseAlgorithm):
             network = builder.load(params['config']['central_value_config'])
             self.config['central_value_config']['network'] = network
 
+    def _plasticity_manager_kwargs(self):
+        """Validate the config's `plasticity:` block and turn it into kwargs.
+
+        Unknown keys are rejected here rather than at the manager's call site:
+        NetworkPlasticityManager takes no **kwargs, so a YAML typo would
+        otherwise surface as a bare TypeError from a constructor the user never
+        wrote.
+        """
+        unknown = sorted(set(self.plasticity_config) - {'enabled'} - set(PLASTICITY_CONFIG_KEYS))
+        if unknown:
+            raise ValueError(
+                'Unknown key(s) in config.plasticity: {}. Supported keys: {}.'.format(
+                    ', '.join(unknown), ', '.join(('enabled',) + PLASTICITY_CONFIG_KEYS)
+                )
+            )
+        return {key: value for key, value in self.plasticity_config.items() if key != 'enabled'}
+
+    def init_plasticity(self):
+        """Attach NetworkPlasticityManager(s) to the already-built model.
+
+        Called by the concrete agents (a2c_continuous/a2c_discrete) right after
+        self.model and self.optimizer exist, and before restore() - A2CBase's
+        own __init__ runs before either is built, so construction can't happen
+        there, but the logic lives here so both algorithms share it.
+        """
+        if not self.plasticity_enabled:
+            return
+
+        manager_kwargs = self._plasticity_manager_kwargs()
+        network = self.model.a2c_network
+
+        if not hasattr(network, 'actor_mlp'):
+            raise NotImplementedError(
+                'config.plasticity is only supported for the "actor_critic" (A2CBuilder) '
+                'network; got {} which has no actor_mlp trunk.'.format(type(network).__name__)
+            )
+        if getattr(network, 'has_rnn', False) or getattr(network, 'is_d2rl', False):
+            raise NotImplementedError(
+                'config.plasticity does not support RNN or D2RL networks yet - site discovery '
+                'cannot tell which layer consumes a trunk unit in those shapes.'
+            )
+
+        value_consumers = linear_consumers(network.get_value_layer())
+        action_consumers = []
+        if getattr(network, 'is_continuous', False):
+            action_consumers += linear_consumers(network.mu)
+            # sigma only reads the trunk when fixed_sigma is False; otherwise
+            # it's a free nn.Parameter with no weight column tied to a unit.
+            if not network.fixed_sigma:
+                action_consumers += linear_consumers(network.sigma)
+        else:
+            action_consumers += linear_consumers(network.logits)
+
+        if getattr(network, 'separate', False):
+            # Two independent trunks: each head may only be attributed to the
+            # trunk it actually reads. Handing both trunks to a single manager
+            # would let equal-width trunks claim each other's heads, since sites
+            # match external consumers by in_features alone.
+            trunks = [
+                ('actor', network.actor_mlp, action_consumers),
+                ('critic', network.critic_mlp, value_consumers),
+            ]
+        else:
+            trunks = [('shared', network.actor_mlp, action_consumers + value_consumers)]
+
+        for name, trunk, consumers in trunks:
+            manager = NetworkPlasticityManager(
+                model=trunk,
+                optimizer=self.optimizer,
+                output_consumers=consumers,
+                name=name,
+                enabled=True,
+                **manager_kwargs
+            )
+
+            if not manager.sites:
+                print('Plasticity: no feature sites discovered in "{}" trunk, skipping'.format(name))
+                manager.close()
+                continue
+
+            # Printed once at startup: the cheapest way to confirm the trunk's
+            # *final* hidden layer was picked up, which only happens if the
+            # output_consumers fallback matched a head above.
+            print('Plasticity: tracking {} site(s) in "{}" trunk: {}'.format(
+                len(manager.sites), name, ', '.join(site.name for site in manager.sites)))
+            self.plasticity_managers.append(manager)
+
+    def _restore_plasticity_state(self, saved):
+        """Restore per-trunk plasticity diagnostics from a checkpoint.
+
+        Called from set_full_state_weights. State is always restored when it is
+        there - there is no config key for this. Every mismatch path reports and
+        starts that manager fresh, and nothing here may raise: losing
+        diagnostics continuity is a nuisance, but taking down an otherwise
+        perfectly resumable run over it would not be.
+
+        The managers themselves need no re-pointing after a restore - see
+        NetworkPlasticityManager.load_state_dict for why the model/optimizer
+        references and the registered hooks all survive it.
+
+        Touches nothing but self.plasticity_managers, so it stays testable
+        against a stub without standing up a whole agent.
+        """
+        if not self.plasticity_managers:
+            if saved:
+                print('Plasticity: checkpoint carries plasticity state but plasticity is not '
+                      'active in this run - ignoring it.')
+            return
+
+        if not saved:
+            print('Plasticity: checkpoint has no plasticity state (saved before it was '
+                  'added?) - diagnostics restart from zero.')
+            return
+
+        for manager in self.plasticity_managers:
+            entry = saved.get(manager.name)
+            if entry is None:
+                print('Plasticity: no saved state for "{}" trunk (checkpoint has: {}) - '
+                      'starting fresh.'.format(manager.name, ', '.join(sorted(saved)) or 'none'))
+                continue
+
+            if manager.load_state_dict(entry):
+                # site_states is empty until a hook has actually fired, so
+                # "0 site state(s)" is the expected line today - the capture
+                # contexts are not wired into the training loop yet.
+                print('Plasticity: restored "{}" trunk (step_count={}, {} site state(s)).'.format(
+                    manager.name, manager.step_count, len(manager.site_states)))
+
+        unused = sorted(set(saved) - {manager.name for manager in self.plasticity_managers})
+        if unused:
+            print('Plasticity: checkpoint had unused plasticity state for: {}.'.format(
+                ', '.join(unused)))
+
     def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
         # do we need scaled time?
         self.diagnostics.send_info(self.writer)
@@ -360,12 +605,11 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('info/epochs', epoch_num, frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
-        # Plasticity diagnostics (Step 2e). getattr default keeps this a
-        # no-op for every agent that doesn't attach any managers (Step 2f
-        # not wired up yet) - write_stats shouldn't require plasticity to
-        # be configured at all. mgr.summary()'s own keys already include
-        # mgr.name as a prefix, so we don't repeat it here.
-        for mgr in getattr(self, 'plasticity_managers', None) or []:
+        # Plasticity diagnostics (Step 2e). plasticity_managers is empty
+        # whenever plasticity is disabled or unconfigured, so this costs
+        # nothing for agents that don't use it. mgr.summary()'s own keys
+        # already include mgr.name as a prefix, so we don't repeat it here.
+        for mgr in self.plasticity_managers:
             for key, value in mgr.summary().items():
                 self.writer.add_scalar(f'plasticity/{key}', value, frame)
 
@@ -391,17 +635,31 @@ class A2CBase(BaseAlgorithm):
         #if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
 
+    # Step 2a: generic, plasticity-agnostic hooks. No-op here so every
+    # non-plasticity algorithm built on A2CBase (SAC, DQN, ...) is unaffected.
+    def plasticity_rollout_context(self):
+        """Overridden by A2CAgent to enter every attached manager's rollout
+        capture; a no-op here so non-plasticity-aware algorithms (SAC, DQN,
+        ...) built on A2CBase aren't coupled to plasticity."""
+        return nullcontext()
+
+    def plasticity_training_context(self):
+        """Overridden by A2CAgent to enter every attached manager's training
+        (forward+backward) capture; a no-op here for the same reason as
+        plasticity_rollout_context()."""
+        return nullcontext()
+
     def get_action_values(self, obs):
         processed_obs = self._preproc_obs(obs['obs'])
         self.model.eval()
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : processed_obs,
             'rnn_states' : self.rnn_states
         }
 
-        with torch.no_grad():
+        with self.plasticity_rollout_context(), torch.no_grad():  # Step 2b: rollout capture
             res_dict = self.model(input_dict)
             if self.has_central_value:
                 states = obs['states']
@@ -604,11 +862,32 @@ class A2CBase(BaseAlgorithm):
 
         # This is actually the best reward ever achieved. last_mean_rewards is perhaps not the best variable name
         # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
-        state['last_mean_rewards'] = self.last_mean_rewards
+        state['last_mean_rewards'] = float(self.last_mean_rewards)
+
+        # Scheduler state. Without these the adaptive schedule silently restarts from
+        # the config values on resume: the optimizer's param_groups come back correct
+        # via its state_dict, but the first scheduler.update() of the resumed run feeds
+        # the stale self.last_lr back in and writes the result onto the optimizer.
+        # float() for the same reason as above - keep numpy scalars out of the
+        # checkpoint so it stays loadable with weights_only=True.
+        state['last_lr'] = float(self.last_lr)
+        state['entropy_coef'] = float(self.entropy_coef)
 
         if self.vec_env is not None:
             env_state = self.vec_env.get_env_state()
             state['env_state'] = env_state
+
+        # Plasticity diagnostics, one entry per managed trunk keyed by manager
+        # name ('actor'/'critic' or 'shared' - init_plasticity guarantees these
+        # are unique). Omitted entirely when plasticity is off, so checkpoints
+        # from non-plasticity runs keep exactly the shape they have today.
+        # Deliberately not in get_weights(): that pair is also the self-play
+        # weight-sync path (self_play_manager) and the shape players read, and
+        # training-only diagnostics have no business on either.
+        if self.plasticity_managers:
+            state['plasticity'] = {
+                manager.name: manager.state_dict() for manager in self.plasticity_managers
+            }
 
         return state
 
@@ -622,10 +901,102 @@ class A2CBase(BaseAlgorithm):
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
 
+        # Defaults keep checkpoints written before these keys existed behaving exactly
+        # as they did: fall back to the config-derived values set in __init__.
+        self.last_lr = weights.get('last_lr', self.last_lr)
+        self.entropy_coef = weights.get('entropy_coef', self.entropy_coef)
+        # No update_lr() here on purpose. optimizer.load_state_dict() above already
+        # restored the saved lr into param_groups, and for a pre-'last_lr' checkpoint
+        # forcing the config default onto the optimizer would be a regression.
+
         env_state = weights.get('env_state', None)
 
         if self.vec_env is not None:
             self.vec_env.set_env_state(env_state)
+
+        # Last on purpose. Nothing above depends on it, and two things argue for
+        # the end: the managers resolve their tensors' device from the trunk's
+        # weights, which should be read after the model has been restored; and a
+        # diagnostics-only feature must never be in a position to abort a resume
+        # of the weights that actually matter.
+        self._restore_plasticity_state(weights.get('plasticity', None))
+
+    def set_warmstart_weights(self, weights):
+        """Apply a checkpoint as a *transfer*, not as a resume.
+
+        Deliberately parallel to set_full_state_weights() rather than a variant
+        of it: resuming an interrupted run wants every last piece of state back,
+        while warm-starting onto a new reward function wants the network and
+        little else. Both read the same checkpoints - only the subset applied
+        differs - so set_full_state_weights() above is left exactly as it was.
+
+        Always taken: the model (which carries the normalizer buffers, see
+        below), the central value net, and the epoch/frame counters - callers
+        size their epoch budget against the inherited count.
+
+        Never taken:
+          * last_mean_rewards. It gates the "best ever" checkpoint save, and a
+            score earned under the previous reward function would suppress every
+            save of this run - leaving nothing for the next transfer to start
+            from.
+          * env_state. The warm-started run gets a fresh environment whose
+            reward function is a different one.
+
+        Optional, per config.warm_start (see WARM_START_CONFIG_KEYS).
+        """
+        # The AMP GradScaler's loss scale is optimizer-side state, so it goes
+        # with the optimizer. set_stats_weights() picks it up out of the same
+        # dict set_weights() is given, hence dropping the key rather than
+        # branching inside that shared method.
+        if self.warm_start_reset_optimizer and 'scaler' in weights:
+            model_weights = dict(weights)
+            model_weights.pop('scaler')
+        else:
+            model_weights = weights
+
+        self.set_weights(model_weights)
+
+        if self.has_central_value:
+            self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
+
+        # After BOTH loads above, not between them. Normalizer statistics are
+        # buffers of RunningMeanStd submodules, so they arrive inside the model
+        # blobs and are already in place by now - there is no checkpoint key to
+        # omit, and resetting one means overwriting the buffers. Doing that
+        # before the central value net is loaded would let its state dict put
+        # the old statistics straight back.
+        if self.warm_start_reset_obs_normalizer and self.normalize_input:
+            _reset_running_mean_std(self.model.running_mean_std)
+            if self.has_central_value:
+                _reset_running_mean_std(self.central_value_net.model.running_mean_std)
+        if self.warm_start_reset_value_normalizer and self.normalize_value:
+            # self.value_mean_std, not self.model.value_mean_std: with a central
+            # value net the former aliases that net's copy, and it is the module
+            # the training loop actually normalizes returns with.
+            _reset_running_mean_std(self.value_mean_std)
+
+        self.epoch_num = weights['epoch']
+        self.frame = weights.get('frame', 0)
+
+        if not self.warm_start_reset_optimizer:
+            self.optimizer.load_state_dict(weights['optimizer'])
+
+        if not self.warm_start_reset_lr_schedule:
+            self.last_lr = weights.get('last_lr', self.last_lr)
+            self.entropy_coef = weights.get('entropy_coef', self.entropy_coef)
+
+        # Unlike the resume path, this needs an explicit push onto the optimizer
+        # whenever either half was reset, because the two sources of the live lr
+        # disagree: optimizer.load_state_dict() restores the checkpoint's lr into
+        # param_groups, while self.last_lr may now hold the config value (or the
+        # reverse, with a fresh optimizer and a restored last_lr). Skipped only
+        # when nothing was reset, which is the resume-equivalent case and where
+        # set_full_state_weights() deliberately does not call update_lr() either.
+        if self.warm_start_reset_lr_schedule or self.warm_start_reset_optimizer:
+            self.update_lr(self.last_lr)
+
+        # Last, for the same reasons as in set_full_state_weights().
+        self._restore_plasticity_state(weights.get('plasticity', None))
 
     def get_weights(self):
         state = self.get_stats_weights()
@@ -965,7 +1336,9 @@ class DiscreteA2CBase(A2CBase):
 
     def train(self):
         self.init_tensors()
-        self.mean_rewards = self.last_mean_rewards = -100500
+        # last_mean_rewards is deliberately not reset here: __init__ already seeds it
+        # with the sentinel for a fresh run, and restore() runs before train(), so
+        # resetting would discard the "best ever" reward loaded from the checkpoint.
         start_time = time.time()
         total_time = 0
         rep_count = 0
@@ -1241,7 +1614,9 @@ class ContinuousA2CBase(A2CBase):
 
     def train(self):
         self.init_tensors()
-        self.last_mean_rewards = -100500
+        # last_mean_rewards is deliberately not reset here: __init__ already seeds it
+        # with the sentinel for a fresh run, and restore() runs before train(), so
+        # resetting would discard the "best ever" reward loaded from the checkpoint.
         start_time = time.time()
         total_time = 0
         rep_count = 0

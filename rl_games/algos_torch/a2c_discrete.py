@@ -33,6 +33,7 @@ class DiscreteA2CAgent(a2c_common.DiscreteA2CBase):
 
         self.last_lr = float(self.last_lr)
         self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.init_plasticity()
 
         if self.has_central_value:
             cv_config = {
@@ -73,6 +74,15 @@ class DiscreteA2CAgent(a2c_common.DiscreteA2CBase):
     def restore(self, fn):
         checkpoint = torch_ext.load_checkpoint(fn)
         self.set_full_state_weights(checkpoint)
+
+    def load_warmstart(self, fn):
+        """Load the same checkpoint restore() reads, but as a transfer.
+
+        Which parts are applied is decided by config.warm_start; see
+        A2CBase.set_warmstart_weights.
+        """
+        checkpoint = torch_ext.load_checkpoint(fn)
+        self.set_warmstart_weights(checkpoint)
 
     def get_masked_action_values(self, obs, action_masks):
         processed_obs = self._preproc_obs(obs['obs'])

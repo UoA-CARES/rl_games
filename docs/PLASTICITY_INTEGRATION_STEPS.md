@@ -463,7 +463,7 @@ ReDo-only, KNIFE-only, or combinations, once A/B/C are validated.
 9. Enable `PlasticityAdam`
 10. Enable CBP replacement, run Experiment C
 11. Benchmark throughput cost of `PlasticityAdam` vs. fused Adam
-12. Add plasticity manager state to checkpointing (see risks below)
+12. ~~Add plasticity manager state to checkpointing~~ — done (see risks below)
 13. Multi-GPU replacement synchronization — later work, not required now
 
 ## Known risks / open verification items
@@ -493,12 +493,28 @@ ReDo-only, KNIFE-only, or combinations, once A/B/C are validated.
 - **Mixed precision** — rl_games uses `torch.cuda.amp.autocast`; hook
   behaviour (forward/backward hooks recording under autocast) needs testing
   under the exact mixed-precision config used, not assumed to work.
-- **Checkpointing gap** — rl_games' checkpointing saves model + optimizer
-  but not plasticity manager state. Full list of state that would need to be
-  included: `optimizer_steps`, neuron ages, utility EMA, bias-correction
-  state, ReDo EMA state, KNIFE/lifetime state, replacement accumulator,
-  replacement counters, reporting state. Resumed runs currently lose all of
-  this silently. Needs addressing if either task's runs are ever resumed
-  from checkpoint.
+- ~~**Checkpointing gap**~~ — resolved for everything that exists today.
+  `NetworkPlasticityManager.state_dict()` / `load_state_dict()` cover neuron
+  ages, utility EMA + bias-correction state, ReDo EMA state, KNIFE/lifetime
+  state and `step_count` (the logging cadence); `A2CBase` writes them under a
+  `plasticity` checkpoint key from `get_full_state_weights` and reads them back
+  in `set_full_state_weights` via `_restore_plasticity_state`. Notes:
+    - The manager's `model`/`optimizer` references and its registered hooks
+      need no fixing up after a restore — rl_games restores in place, so the
+      modules and Parameters the hooks are bound to keep their identity. This
+      breaks if anything ever uses `load_state_dict(..., assign=True)` or
+      rebuilds the network after `init_plasticity()`.
+    - Tensors are saved on the CPU and placed back on each site's producer
+      device at load, because `torch_ext.load_checkpoint` calls `torch.load()`
+      with no `map_location`.
+    - The raw activation window (`behaviour_chunks`) is deliberately not
+      saved — `_reset_summary_windows` clears it at every log anyway, and it
+      would add tens of MB per site to every checkpoint.
+    - Mismatches (missing key, changed site names or widths, unknown version)
+      warn and start that manager fresh; nothing on this path can raise.
+    - Still outstanding: `optimizer_steps`, the replacement accumulator and
+      replacement counters, none of which exist yet — they are part of the CBP
+      replacement work (steps 9-10) and must be added to `state_dict()` when
+      they land. Reporting state (`last_summary`) is intentionally not saved.
 - **Config duplication** — no shared base YAML between tasks, so any future
   tuning of shared plasticity defaults must be kept in sync by hand.

@@ -5,8 +5,9 @@ from rl_games.algos_torch import central_value
 from rl_games.common import common_losses
 from rl_games.common import datasets
 
+from contextlib import ExitStack, nullcontext
 from torch import optim
-import torch 
+import torch
 from torch import nn
 import numpy as np
 import gym
@@ -31,6 +32,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.last_lr = float(self.last_lr)
         self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
         self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.init_plasticity()
 
         if self.has_central_value:
             cv_config = {
@@ -63,7 +65,31 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
     def update_epoch(self):
         self.epoch_num += 1
         return self.epoch_num
-        
+
+    # Step 2b: A2CAgent's override of the Step 2a hook - enters every
+    # attached manager's rollout capture (capture_metrics()).
+    def plasticity_rollout_context(self):
+        """Enter every attached manager's rollout-activation capture around
+        the real rollout forward pass (see A2CBase.get_action_values)."""
+        if not self.plasticity_managers:
+            return nullcontext()
+        stack = ExitStack()
+        for mgr in self.plasticity_managers:
+            stack.enter_context(mgr.capture_metrics())
+        return stack
+
+    # Step 2c: A2CAgent's override of the Step 2a hook - enters every
+    # attached manager's training capture (capture_training()).
+    def plasticity_training_context(self):
+        """Enter every attached manager's training (forward+backward)
+        capture around the real training pass (see calc_gradients)."""
+        if not self.plasticity_managers:
+            return nullcontext()
+        stack = ExitStack()
+        for mgr in self.plasticity_managers:
+            stack.enter_context(mgr.capture_training())
+        return stack
+
     def save(self, fn):
         state = self.get_full_state_weights()
         torch_ext.save_checkpoint(fn, state)
@@ -71,6 +97,15 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
     def restore(self, fn):
         checkpoint = torch_ext.load_checkpoint(fn)
         self.set_full_state_weights(checkpoint)
+
+    def load_warmstart(self, fn):
+        """Load the same checkpoint restore() reads, but as a transfer.
+
+        Which parts are applied is decided by config.warm_start; see
+        A2CBase.set_warmstart_weights.
+        """
+        checkpoint = torch_ext.load_checkpoint(fn)
+        self.set_warmstart_weights(checkpoint)
 
     def get_masked_action_values(self, obs, action_masks):
         assert False
@@ -104,38 +139,39 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             if self.zero_rnn_on_done:
                 batch_dict['dones'] = input_dict['dones']            
 
-        with torch.cuda.amp.autocast(enabled=self.mixed_precision):
-            res_dict = self.model(batch_dict)
-            action_log_probs = res_dict['prev_neglogp']
-            values = res_dict['values']
-            entropy = res_dict['entropy']
-            mu = res_dict['mus']
-            sigma = res_dict['sigmas']
+        with self.plasticity_training_context():  # Step 2c: training capture
+            with torch.cuda.amp.autocast(enabled=self.mixed_precision):
+                res_dict = self.model(batch_dict)
+                action_log_probs = res_dict['prev_neglogp']
+                values = res_dict['values']
+                entropy = res_dict['entropy']
+                mu = res_dict['mus']
+                sigma = res_dict['sigmas']
 
-            a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+                a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
-            if self.has_value_loss:
-                c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
-            else:
-                c_loss = torch.zeros(1, device=self.ppo_device)
-            if self.bound_loss_type == 'regularisation':
-                b_loss = self.reg_loss(mu)
-            elif self.bound_loss_type == 'bound':
-                b_loss = self.bound_loss(mu)
-            else:
-                b_loss = torch.zeros(1, device=self.ppo_device)
-            losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
-            a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+                if self.has_value_loss:
+                    c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
+                else:
+                    c_loss = torch.zeros(1, device=self.ppo_device)
+                if self.bound_loss_type == 'regularisation':
+                    b_loss = self.reg_loss(mu)
+                elif self.bound_loss_type == 'bound':
+                    b_loss = self.bound_loss(mu)
+                else:
+                    b_loss = torch.zeros(1, device=self.ppo_device)
+                losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
+                a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
 
-            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
-            
-            if self.multi_gpu:
-                self.optimizer.zero_grad()
-            else:
-                for param in self.model.parameters():
-                    param.grad = None
+                loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
 
-        self.scaler.scale(loss).backward()
+                if self.multi_gpu:
+                    self.optimizer.zero_grad()
+                else:
+                    for param in self.model.parameters():
+                        param.grad = None
+
+            self.scaler.scale(loss).backward()
         #TODO: Refactor this ugliest code of they year
         self.trancate_gradients_and_step()
 

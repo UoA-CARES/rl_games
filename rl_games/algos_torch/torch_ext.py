@@ -4,7 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.optimizer import Optimizer
+import importlib
 import math
+import pickle
 import time
 
 numpy_to_torch_dtype_dict = {
@@ -51,6 +53,11 @@ def shape_cwh_to_whc(shape):
 
     return shape
 
+# Deterministic deserialization failures: retrying cannot help, and the backoff
+# loop below would otherwise bury the real cause behind a generic RuntimeError.
+_NON_RETRYABLE = (pickle.UnpicklingError, AttributeError, ModuleNotFoundError)
+
+
 def safe_filesystem_op(func, *args, **kwargs):
     """
     This is to prevent spurious crashes related to saving checkpoints or restoring from checkpoints in a Network
@@ -60,6 +67,8 @@ def safe_filesystem_op(func, *args, **kwargs):
     for attempt in range(num_attempts):
         try:
             return func(*args, **kwargs)
+        except _NON_RETRYABLE:
+            raise
         except Exception as exc:
             print(f'Exception {exc} when trying to execute {func} with args:{args} and kwargs:{kwargs}...')
             wait_sec = 2 ** attempt
@@ -71,8 +80,78 @@ def safe_filesystem_op(func, *args, **kwargs):
 def safe_save(state, filename):
     return safe_filesystem_op(torch.save, state, filename)
 
-def safe_load(filename):
-    return safe_filesystem_op(torch.load, filename)
+
+_numpy_safe_globals_registered = False
+
+
+def _register_numpy_safe_globals():
+    """
+    Allowlist the numpy globals rl_games writes into checkpoints so they survive
+    torch.load(weights_only=True) - the default from torch 2.6 on. The offender is
+    'last_mean_rewards', a numpy scalar produced by AverageMeter.get_mean().
+
+    Best effort only: the module layout moved (numpy.core -> numpy._core in numpy 2)
+    and add_safe_globals did not exist before torch 2.3, so everything is looked up
+    defensively. safe_load()'s fallback is what actually guarantees the load works.
+    """
+    global _numpy_safe_globals_registered
+    if _numpy_safe_globals_registered:
+        return
+    _numpy_safe_globals_registered = True
+
+    add_safe_globals = getattr(torch.serialization, 'add_safe_globals', None)
+    if add_safe_globals is None:
+        return
+
+    allowed = []
+    for module_name, attr_names in (
+        ('numpy', ('dtype', 'ndarray')),
+        ('numpy.core.multiarray', ('scalar', '_reconstruct')),
+        ('numpy._core.multiarray', ('scalar', '_reconstruct')),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        for attr_name in attr_names:
+            obj = getattr(module, attr_name, None)
+            if obj is not None:
+                allowed.append(obj)
+
+    # numpy 2 pickles a dtype as its concrete class (Float32DType and friends).
+    try:
+        numpy_dtypes = importlib.import_module('numpy.dtypes')
+    except Exception:
+        pass
+    else:
+        allowed.extend(
+            obj for name, obj in vars(numpy_dtypes).items()
+            if name.endswith('DType') and isinstance(obj, type)
+        )
+
+    try:
+        add_safe_globals(allowed)
+    except Exception as exc:
+        print(f'Could not allowlist numpy globals for weights_only loading: {exc}')
+
+
+def _torch_load(filename, map_location, weights_only):
+    try:
+        return torch.load(filename, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        # torch < 1.13 has no weights_only kwarg; there the default is already False.
+        return torch.load(filename, map_location=map_location)
+
+
+def safe_load(filename, map_location=None):
+    _register_numpy_safe_globals()
+    try:
+        return safe_filesystem_op(_torch_load, filename, map_location, True)
+    except pickle.UnpicklingError as exc:
+        print(f'WARNING: strict checkpoint load of {filename} failed: {exc}')
+        print('WARNING: retrying with weights_only=False - this executes arbitrary code '
+              'from the checkpoint. Only continue if you trust its source.')
+        return safe_filesystem_op(_torch_load, filename, map_location, False)
 
 def save_checkpoint(filename, state):
     print("=> saving checkpoint '{}'".format(filename + '.pth'))
