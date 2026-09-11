@@ -161,7 +161,12 @@ class DiscreteA2CAgent(a2c_common.DiscreteA2CBase):
             
             losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss, entropy.unsqueeze(1)], rnn_masks)
             a_loss, c_loss, entropy = losses[0], losses[1], losses[2]
-            loss = a_loss + 0.5 *c_loss * self.critic_coef - entropy * self.entropy_coef
+            if self.critic_warmup_active:
+                # Critic-only epoch - see A2CAgent.calc_gradients for why the
+                # actor terms are computed but left out of the objective.
+                loss = 0.5 * c_loss * self.critic_coef
+            else:
+                loss = a_loss + 0.5 *c_loss * self.critic_coef - entropy * self.entropy_coef
 
             if self.multi_gpu:
                 self.optimizer.zero_grad()
@@ -169,8 +174,11 @@ class DiscreteA2CAgent(a2c_common.DiscreteA2CBase):
                 for param in self.model.parameters():
                     param.grad = None
 
-        self.scaler.scale(loss).backward()
-        self.trancate_gradients_and_step()
+        # A critic-only loss has no graph when has_value_loss is false; see
+        # A2CAgent.calc_gradients.
+        if not (self.critic_warmup_active and not self.has_value_loss):
+            self.scaler.scale(loss).backward()
+            self.trancate_gradients_and_step()
 
         with torch.no_grad():
             kl_dist = 0.5 * ((old_action_log_probs_batch - action_log_probs)**2)

@@ -32,7 +32,7 @@ import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum, auto
-from typing import Any, Iterator, Literal
+from typing import Any, Iterator, Literal, Literal
 
 import torch
 from torch import nn
@@ -289,6 +289,7 @@ class NetworkPlasticityManager:
         optimizer: Optimizer,  # Optimizer used to read parameter updates for utility metrics.
         output_consumers: list[nn.Linear] | None = None,  # External linear heads consuming trunk features.
         name: str = "network",  # Label used to identify this network in summaries and diagnostics.
+
 
         enabled: bool = True,  # Enables or disables discovery, hooks, and metric collection.
         replacement_enabled:bool = False, # TODO: Neuron replacement for injecting plasticity on or off.

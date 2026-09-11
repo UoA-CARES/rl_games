@@ -66,12 +66,22 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.epoch_num += 1
         return self.epoch_num
 
+    def _is_plasticity_suspended(self):
+        """Whether plasticity capture should sit this pass out.
+
+        Suspended during a critic warmup: a frozen trunk produces no weight
+        change, so every unit in it reads as dormant and could be replaced for
+        no reason other than that it was deliberately held still. Skipping the
+        context suspends both the dormancy capture and any replacement.
+        """
+        return not self.plasticity_managers or self.critic_warmup_active
+
     # Step 2b: A2CAgent's override of the Step 2a hook - enters every
     # attached manager's rollout capture (capture_metrics()).
     def plasticity_rollout_context(self):
         """Enter every attached manager's rollout-activation capture around
         the real rollout forward pass (see A2CBase.get_action_values)."""
-        if not self.plasticity_managers:
+        if self._is_plasticity_suspended():
             return nullcontext()
         stack = ExitStack()
         for mgr in self.plasticity_managers:
@@ -83,7 +93,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
     def plasticity_training_context(self):
         """Enter every attached manager's training (forward+backward)
         capture around the real training pass (see calc_gradients)."""
-        if not self.plasticity_managers:
+        if self._is_plasticity_suspended():
             return nullcontext()
         stack = ExitStack()
         for mgr in self.plasticity_managers:
@@ -124,6 +134,14 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         lr_mul = 1.0
         curr_e_clip = self.e_clip
 
+        # A critic-only epoch optimizes c_loss alone - but with a central value
+        # net and use_experimental_cv false, c_loss is a constant zero tensor, so
+        # that objective carries no graph and backward() would raise. Sitting the
+        # step out costs nothing there: the critic in that configuration *is* the
+        # central value net, which trains in its own loop (train_central_value)
+        # and is untouched by the freeze.
+        skip_step = self.critic_warmup_active and not self.has_value_loss
+
         batch_dict = {
             'is_train': True,
             'prev_actions': actions_batch, 
@@ -163,7 +181,15 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
                 a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
 
-                loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+                if self.critic_warmup_active:
+                    # Critic-only epoch. The actor terms are still computed above
+                    # so they keep being logged, but they are left out of the
+                    # optimized objective: the requires_grad freeze already stops
+                    # them reaching a parameter, and dropping them here avoids
+                    # backprop through the actor path entirely.
+                    loss = 0.5 * c_loss * self.critic_coef
+                else:
+                    loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
 
                 if self.multi_gpu:
                     self.optimizer.zero_grad()
@@ -171,9 +197,11 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                     for param in self.model.parameters():
                         param.grad = None
 
-            self.scaler.scale(loss).backward()
+            if not skip_step:
+                self.scaler.scale(loss).backward()
         #TODO: Refactor this ugliest code of they year
-        self.trancate_gradients_and_step()
+        if not skip_step:
+            self.trancate_gradients_and_step()
 
         with torch.no_grad():
             reduce_kl = rnn_masks is None
