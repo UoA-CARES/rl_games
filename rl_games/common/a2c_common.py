@@ -1166,8 +1166,53 @@ class A2CBase(BaseAlgorithm):
         if self.mixed_precision and 'scaler' in weights:
             self.scaler.load_state_dict(weights['scaler'])
 
+    def _describe_trunk_shape_mismatch(self, model_weights):
+        """Explain a state_dict mismatch caused by network.separate, or return None.
+
+        The single thing that most often makes a previously-good checkpoint stop
+        loading is flipping network.separate: the separate build adds a whole
+        critic_mlp/critic_cnn trunk that the shared build does not have, so the
+        keys simply do not line up. PyTorch reports that as a bare list of
+        missing/unexpected keys, which does not point at the config that caused
+        it. Returns None whenever the shapes agree, so any *other* mismatch
+        keeps its original error untouched.
+        """
+        network = getattr(self.model, 'a2c_network', None)
+        if network is None:
+            return None
+
+        model_is_separate = bool(getattr(network, 'separate', False))
+        # critic_mlp exists as an empty nn.Sequential under separate=False, so it
+        # contributes no keys there - presence of a key is the reliable signal.
+        ckpt_is_separate = any(
+            '.critic_mlp.' in key or key.startswith('critic_mlp.')
+            for key in model_weights.keys()
+        )
+
+        if model_is_separate == ckpt_is_separate:
+            return None
+
+        shape = lambda separate: (
+            'separate actor/critic trunks (network.separate: True)' if separate
+            else 'a shared actor/critic trunk (network.separate: False)'
+        )
+        return (
+            'checkpoint/network shape mismatch: this run builds {}, but the checkpoint '
+            'was trained with {}. A checkpoint cannot be resumed or warm-started across '
+            'that change - the critic trunk exists on only one side. Either train from '
+            'scratch under the current setting, or set network.separate back to {} to '
+            'match the checkpoint.'.format(
+                shape(model_is_separate), shape(ckpt_is_separate), ckpt_is_separate)
+        )
+
     def set_weights(self, weights):
-        self.model.load_state_dict(weights['model'])
+        try:
+            self.model.load_state_dict(weights['model'])
+        except RuntimeError as exc:
+            explanation = self._describe_trunk_shape_mismatch(weights['model'])
+            if explanation is None:
+                raise
+            raise RuntimeError(explanation) from exc
         self.set_stats_weights(weights)
 
     def _preproc_obs(self, obs_batch):
