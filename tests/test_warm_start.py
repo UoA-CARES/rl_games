@@ -127,6 +127,7 @@ class _Agent:
     load_resume = A2CBase.set_full_state_weights
     load_warm = A2CBase.set_warmstart_weights
     set_weights = A2CBase.set_weights
+    _describe_trunk_shape_mismatch = A2CBase._describe_trunk_shape_mismatch
     set_stats_weights = A2CBase.set_stats_weights
     get_weights = A2CBase.get_weights
     get_stats_weights = A2CBase.get_stats_weights
@@ -818,3 +819,57 @@ def test_unsupported_network_is_rejected_by_name():
         assert 'critic_warmup_epoch_count' in str(e)
     else:
         assert False, 'expected NotImplementedError naming the unsupported network'
+
+
+# --------------------------------------------------------------------------
+# Trunk-shape guard: flipping network.separate makes old checkpoints unloadable,
+# and PyTorch reports that as a bare key list that never names the cause.
+
+def _model_weights(separate):
+    return _NetworkAgent(separate=separate).get_weights()
+
+
+def test_shared_checkpoint_into_separate_model_names_the_cause():
+    agent = _NetworkAgent(separate=True)
+    try:
+        agent.set_weights(_model_weights(separate=False))
+    except RuntimeError as e:
+        message = str(e)
+        assert 'network.separate: True' in message
+        assert 'network.separate: False' in message
+        # The original key list stays reachable for anyone who needs it.
+        assert isinstance(e.__cause__, RuntimeError)
+    else:
+        assert False, 'expected RuntimeError explaining the trunk shape mismatch'
+
+
+def test_separate_checkpoint_into_shared_model_names_the_cause():
+    agent = _NetworkAgent(separate=False)
+    try:
+        agent.set_weights(_model_weights(separate=True))
+    except RuntimeError as e:
+        assert 'network.separate' in str(e)
+        assert isinstance(e.__cause__, RuntimeError)
+    else:
+        assert False, 'expected RuntimeError explaining the trunk shape mismatch'
+
+
+def test_matching_shapes_still_load():
+    # The guard must be purely additive: anything that loaded before still loads.
+    for separate in (False, True):
+        agent = _NetworkAgent(separate=separate)
+        agent.set_weights(_model_weights(separate=separate))
+
+
+def test_unrelated_mismatch_keeps_its_original_error():
+    # A mismatch that is *not* about the trunk shape must not be relabelled.
+    agent = _NetworkAgent(separate=False)
+    weights = _model_weights(separate=False)
+    weights['model'].pop(next(k for k in weights['model'] if 'actor_mlp' in k))
+    try:
+        agent.set_weights(weights)
+    except RuntimeError as e:
+        assert 'network.separate' not in str(e)
+        assert e.__cause__ is None
+    else:
+        assert False, 'expected the original RuntimeError'
