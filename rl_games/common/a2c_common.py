@@ -436,9 +436,9 @@ class A2CBase(BaseAlgorithm):
 
         The structural assumptions below (actor_mlp trunk, mu/sigma/value as
         siblings of it, no rnn/d2rl) are read off network_builder.py's
-        A2CBuilder as of plasticity.PLASTICITY_BASE_COMMIT - this fork has no
-        __version__ to assert against, so that constant is the documented
-        pin. A future rebase of the fork should re-check this method and
+        A2CBuilder as of the fork commit pinned in docs/PLASTICITY_
+        INTEGRATION_STEPS.md - this fork has no __version__ to assert
+        against. A future rebase of the fork should re-check this method and
         _discover_sites against whatever A2CBuilder looks like then.
         """
         if not self.plasticity_enabled:

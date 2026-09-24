@@ -38,18 +38,14 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 
-# Step 2f version-coupling guard. This fork (isaac-sim/rl_games, not upstream
-# Denys88/rl_games - see docs/PLASTICITY_INTEGRATION_STEPS.md) has no
-# rl_games.__version__ attribute at all, so there is nothing to assert
-# against at runtime. This constant is the documented substitute: the exact
-# commit this file's structural assumptions about A2CBuilder were read from
-# and validated against (network_builder.py's actor_mlp/mu/sigma/value shape
-# - see _discover_sites and a2c_common.init_plasticity). Deliberately not an
-# automated check - it exists so a future rebase/upgrade of the fork is a
-# conscious, visible "did the trunk/head shape change" step for whoever does
-# it, rather than silent structural drift nobody notices until diagnostics or
-# replacement start behaving strangely.
-PLASTICITY_BASE_COMMIT = '6b3534f29568158e9e29ec8bf83cc88fce5f0cae'
+# Step 2f version-coupling note: this file's structural assumptions about
+# A2CBuilder (actor_mlp/mu/sigma/value shape - see _discover_sites and
+# a2c_common.init_plasticity) were read from and validated against one
+# specific commit of this fork (isaac-sim/rl_games, not upstream
+# Denys88/rl_games), pinned in docs/PLASTICITY_INTEGRATION_STEPS.md. This
+# fork has no rl_games.__version__ to assert against at runtime, so a future
+# rebase/upgrade should re-check _discover_sites/init_plasticity against
+# that doc rather than assuming silent compatibility.
 
 SUPPORTED_TRAINABLE_LAYERS = (nn.Linear,)
 
